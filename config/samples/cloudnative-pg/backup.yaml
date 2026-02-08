@@ -1,0 +1,8 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: Backup
+metadata:
+  name: my-cluster-backup
+  namespace: default
+spec:
+  contractRef: cloudnative-pg
+  targetName: my-cluster

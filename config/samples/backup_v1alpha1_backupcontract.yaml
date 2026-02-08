@@ -1,0 +1,9 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: BackupContract
+metadata:
+  labels:
+    app.kubernetes.io/name: janus
+    app.kubernetes.io/managed-by: kustomize
+  name: backupcontract-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,68 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: BackupContract
+metadata:
+  name: cloudnative-pg
+spec:
+  target:
+    apiGroup: postgresql.cnpg.io
+    kind: Cluster
+
+  quiesce:
+    patch:
+      merge:
+        spec:
+          nodeMaintenanceWindow:
+            inProgress: true
+    ready:
+      condition: >-
+        object.status.conditions.exists(c,
+          c.type == 'Ready' && c.status == 'False')
+      timeout: 5m
+
+  resume:
+    patch:
+      merge:
+        spec:
+          nodeMaintenanceWindow:
+            inProgress: false
+    ready:
+      condition: >-
+        object.status.conditions.exists(c,
+          c.type == 'Ready' && c.status == 'True')
+      timeout: 10m
+
+  critical:
+    - kind: PersistentVolumeClaim
+      selector:
+        cnpg.io/cluster: ""
+    - kind: Secret
+      selector:
+        cnpg.io/cluster: ""
+
+  derivable:
+    - kind: ConfigMap
+      selector:
+        cnpg.io/cluster: ""
+    - kind: Service
+      selector:
+        cnpg.io/cluster: ""
+
+  restore:
+    order:
+      - selector:
+          kind: Secret
+      - selector:
+          kind: PersistentVolumeClaim
+        ready:
+          condition: "object.status.phase == 'Bound'"
+          timeout: 5m
+      - selector:
+          apiGroup: postgresql.cnpg.io
+          kind: Cluster
+    verify:
+      condition: >-
+        object.status.conditions.exists(c,
+          c.type == 'Ready' && c.status == 'True') &&
+        has(object.status.readyInstances) &&
+        object.status.readyInstances == object.spec.instances
+      timeout: 15m
