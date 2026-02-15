@@ -327,7 +327,7 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
 		})
 		ac := client.ApplyConfigurationFromUnstructured(obj)
-		return r.Client.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
+		return r.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
 
 	case backupv1alpha1.ChangeTypeDelete:
 		existing, err := r.getResource(ctx, change.Target, namespace)

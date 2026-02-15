@@ -54,6 +54,11 @@ func newManagerWithInterceptors(funcs interceptor.Funcs, objs ...client.Object) 
 	return &LeaseManager{Client: c}
 }
 
+const (
+	txnOwner = "txn-1"
+	txnOther = "txn-other"
+)
+
 var (
 	testKey = ResourceKey{Namespace: "default", Kind: "ConfigMap", Name: "my-cm"}
 	testCtx = context.Background()
@@ -80,7 +85,7 @@ func TestLeaseName_Lowercases(t *testing.T) {
 
 func TestAcquire_CreatesNewLease(t *testing.T) {
 	m := newManager()
-	name, err := m.Acquire(testCtx, testKey, "txn-1", 5*time.Minute)
+	name, err := m.Acquire(testCtx, testKey, txnOwner, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -93,16 +98,16 @@ func TestAcquire_CreatesNewLease(t *testing.T) {
 	if err := m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease); err != nil {
 		t.Fatalf("lease not found: %v", err)
 	}
-	if *lease.Spec.HolderIdentity != "txn-1" {
+	if *lease.Spec.HolderIdentity != txnOwner {
 		t.Fatalf("unexpected holder: %s", *lease.Spec.HolderIdentity)
 	}
-	if lease.Labels["janus.io/transaction"] != "txn-1" {
+	if lease.Labels["janus.io/transaction"] != txnOwner {
 		t.Fatalf("missing transaction label")
 	}
 }
 
 func TestAcquire_RenewsExistingLease(t *testing.T) {
-	holder := "txn-1"
+	holder := txnOwner
 	dur := int32(300)
 	now := metav1.NewMicroTime(time.Now())
 	existing := &coordinationv1.Lease{
@@ -123,7 +128,7 @@ func TestAcquire_RenewsExistingLease(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	name, err := m.Acquire(testCtx, testKey, "txn-1", 10*time.Minute)
+	name, err := m.Acquire(testCtx, testKey, txnOwner, 10*time.Minute)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -140,7 +145,7 @@ func TestAcquire_RenewsExistingLease(t *testing.T) {
 }
 
 func TestAcquire_RejectsWhenHeldByDifferentTxn(t *testing.T) {
-	holder := "txn-other"
+	holder := txnOther
 	dur := int32(3600) // Far from expired.
 	now := metav1.NewMicroTime(time.Now())
 	existing := &coordinationv1.Lease{
@@ -161,7 +166,7 @@ func TestAcquire_RejectsWhenHeldByDifferentTxn(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	_, err := m.Acquire(testCtx, testKey, "txn-1", 5*time.Minute)
+	_, err := m.Acquire(testCtx, testKey, txnOwner, 5*time.Minute)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -169,7 +174,7 @@ func TestAcquire_RejectsWhenHeldByDifferentTxn(t *testing.T) {
 	if !errors.As(err, &alErr) {
 		t.Fatalf("expected ErrAlreadyLocked, got: %v", err)
 	}
-	if alErr.Holder != "txn-other" {
+	if alErr.Holder != txnOther {
 		t.Fatalf("unexpected holder in error: %s", alErr.Holder)
 	}
 }
@@ -218,7 +223,7 @@ func TestAcquire_GetError(t *testing.T) {
 		},
 	})
 
-	_, err := m.Acquire(testCtx, testKey, "txn-1", 5*time.Minute)
+	_, err := m.Acquire(testCtx, testKey, txnOwner, 5*time.Minute)
 	if err == nil || err.Error() != fmt.Sprintf("getting lease %s: synthetic get error", LeaseName(testKey)) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -231,14 +236,14 @@ func TestAcquire_CreateError(t *testing.T) {
 		},
 	})
 
-	_, err := m.Acquire(testCtx, testKey, "txn-1", 5*time.Minute)
+	_, err := m.Acquire(testCtx, testKey, txnOwner, 5*time.Minute)
 	if err == nil || err.Error() != fmt.Sprintf("creating lease %s: synthetic create error", LeaseName(testKey)) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestAcquire_RenewError(t *testing.T) {
-	holder := "txn-1"
+	holder := txnOwner
 	dur := int32(300)
 	now := metav1.NewMicroTime(time.Now())
 	existing := &coordinationv1.Lease{
@@ -263,7 +268,7 @@ func TestAcquire_RenewError(t *testing.T) {
 		},
 	}, existing)
 
-	_, err := m.Acquire(testCtx, testKey, "txn-1", 5*time.Minute)
+	_, err := m.Acquire(testCtx, testKey, txnOwner, 5*time.Minute)
 	if err == nil || err.Error() != fmt.Sprintf("renewing lease %s: synthetic update error", LeaseName(testKey)) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -361,7 +366,7 @@ func TestReleaseAll_MultipleLeasesReleased(t *testing.T) {
 	}
 	m := newManager(leases...)
 
-	err := m.ReleaseAll(testCtx, "txn-1", []string{name1, name2})
+	err := m.ReleaseAll(testCtx, txnOwner, []string{name1, name2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -375,7 +380,7 @@ func TestReleaseAll_MultipleLeasesReleased(t *testing.T) {
 
 func TestReleaseAll_SkipsEmptyNames(t *testing.T) {
 	m := newManager()
-	err := m.ReleaseAll(testCtx, "txn-1", []string{"", "", ""})
+	err := m.ReleaseAll(testCtx, txnOwner, []string{"", "", ""})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -388,7 +393,7 @@ func TestReleaseAll_ReturnsFirstError(t *testing.T) {
 		},
 	})
 
-	err := m.ReleaseAll(testCtx, "txn-1", []string{"lease-a", "lease-b"})
+	err := m.ReleaseAll(testCtx, txnOwner, []string{"lease-a", "lease-b"})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -400,7 +405,7 @@ func TestReleaseAll_ReturnsFirstError(t *testing.T) {
 // --- IsHeldBy ---
 
 func TestIsHeldBy_HeldByCorrectTxn(t *testing.T) {
-	holder := "txn-1"
+	holder := txnOwner
 	dur := int32(3600)
 	now := metav1.NewMicroTime(time.Now())
 	name := LeaseName(testKey)
@@ -420,7 +425,7 @@ func TestIsHeldBy_HeldByCorrectTxn(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	held, err := m.IsHeldBy(testCtx, name, "txn-1")
+	held, err := m.IsHeldBy(testCtx, name, txnOwner)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -430,7 +435,7 @@ func TestIsHeldBy_HeldByCorrectTxn(t *testing.T) {
 }
 
 func TestIsHeldBy_HeldByDifferentTxn(t *testing.T) {
-	holder := "txn-other"
+	holder := txnOther
 	dur := int32(3600)
 	now := metav1.NewMicroTime(time.Now())
 	name := LeaseName(testKey)
@@ -439,7 +444,7 @@ func TestIsHeldBy_HeldByDifferentTxn(t *testing.T) {
 			Name: name, Namespace: "default",
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "janus",
-				"janus.io/transaction":         "txn-1", // Label says txn-1 but holder is txn-other.
+				"janus.io/transaction":         txnOwner, // Label says txn-1 but holder is txn-other.
 			},
 		},
 		Spec: coordinationv1.LeaseSpec{
@@ -450,7 +455,7 @@ func TestIsHeldBy_HeldByDifferentTxn(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	held, err := m.IsHeldBy(testCtx, name, "txn-1")
+	held, err := m.IsHeldBy(testCtx, name, txnOwner)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -462,7 +467,7 @@ func TestIsHeldBy_HeldByDifferentTxn(t *testing.T) {
 func TestIsHeldBy_LeaseNotFound(t *testing.T) {
 	m := newManager()
 
-	held, err := m.IsHeldBy(testCtx, "nonexistent", "txn-1")
+	held, err := m.IsHeldBy(testCtx, "nonexistent", txnOwner)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -472,7 +477,7 @@ func TestIsHeldBy_LeaseNotFound(t *testing.T) {
 }
 
 func TestIsHeldBy_LeaseExpired(t *testing.T) {
-	holder := "txn-1"
+	holder := txnOwner
 	dur := int32(1)
 	past := metav1.NewMicroTime(time.Now().Add(-10 * time.Second))
 	name := LeaseName(testKey)
@@ -492,7 +497,7 @@ func TestIsHeldBy_LeaseExpired(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	held, err := m.IsHeldBy(testCtx, name, "txn-1")
+	held, err := m.IsHeldBy(testCtx, name, txnOwner)
 	if held {
 		t.Fatal("expected held=false")
 	}
@@ -509,7 +514,7 @@ func TestIsHeldBy_ListError(t *testing.T) {
 		},
 	})
 
-	_, err := m.IsHeldBy(testCtx, "some-lease", "txn-1")
+	_, err := m.IsHeldBy(testCtx, "some-lease", txnOwner)
 	if err == nil || err.Error() != "listing leases: list error" {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -578,8 +583,8 @@ func TestIsExpired_Expired(t *testing.T) {
 // --- Error types ---
 
 func TestErrAlreadyLocked_Error(t *testing.T) {
-	err := &ErrAlreadyLocked{LeaseName: "lease-1", Holder: "txn-other"}
-	expected := `resource is locked by "txn-other" (lease lease-1)`
+	err := &ErrAlreadyLocked{LeaseName: "lease-1", Holder: txnOther}
+	expected := `resource is locked by txnOther (lease lease-1)`
 	if err.Error() != expected {
 		t.Fatalf("unexpected: %s", err.Error())
 	}

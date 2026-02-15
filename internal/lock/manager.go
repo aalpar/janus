@@ -203,6 +203,6 @@ func (m *LeaseManager) isExpired(lease *coordinationv1.Lease) bool {
 	if lease.Spec.RenewTime == nil || lease.Spec.LeaseDurationSeconds == nil {
 		return true
 	}
-	expiry := lease.Spec.RenewTime.Time.Add(time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second)
+	expiry := lease.Spec.RenewTime.Add(time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second)
 	return time.Now().After(expiry)
 }
