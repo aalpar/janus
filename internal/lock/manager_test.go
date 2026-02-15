@@ -584,7 +584,7 @@ func TestIsExpired_Expired(t *testing.T) {
 
 func TestErrAlreadyLocked_Error(t *testing.T) {
 	err := &ErrAlreadyLocked{LeaseName: "lease-1", Holder: txnOther}
-	expected := `resource is locked by txnOther (lease lease-1)`
+	expected := `resource is locked by "txn-other" (lease lease-1)`
 	if err.Error() != expected {
 		t.Fatalf("unexpected: %s", err.Error())
 	}
