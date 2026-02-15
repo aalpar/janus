@@ -37,6 +37,7 @@ import (
 
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
 	"github.com/aalpar/janus/internal/controller"
+	"github.com/aalpar/janus/internal/lock"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -178,25 +179,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.BackupContractReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+	if err := (&controller.TransactionReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		LockMgr: &lock.LeaseManager{Client: mgr.GetClient()},
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "BackupContract")
-		os.Exit(1)
-	}
-	if err := (&controller.BackupReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Backup")
-		os.Exit(1)
-	}
-	if err := (&controller.RestoreReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Restore")
+		setupLog.Error(err, "unable to create controller", "controller", "Transaction")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

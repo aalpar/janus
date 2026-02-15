@@ -1,6 +1,4 @@
 ## Append samples of your project ##
 resources:
-- backup_v1alpha1_backupcontract.yaml
-- backup_v1alpha1_backup.yaml
-- backup_v1alpha1_restore.yaml
+- transaction_sample.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

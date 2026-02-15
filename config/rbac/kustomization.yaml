@@ -22,13 +22,5 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the janus itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
-- restore_admin_role.yaml
-- restore_editor_role.yaml
-- restore_viewer_role.yaml
-- backup_admin_role.yaml
-- backup_editor_role.yaml
-- backup_viewer_role.yaml
-- backupcontract_admin_role.yaml
-- backupcontract_editor_role.yaml
-- backupcontract_viewer_role.yaml
-
+- transaction_editor_role.yaml
+- transaction_viewer_role.yaml

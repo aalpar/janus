@@ -15,25 +15,7 @@ resources:
   controller: true
   domain: janus.io
   group: backup
-  kind: BackupContract
-  path: github.com/aalpar/janus/api/v1alpha1
-  version: v1alpha1
-- api:
-    crdVersion: v1
-    namespaced: true
-  controller: true
-  domain: janus.io
-  group: backup
-  kind: Backup
-  path: github.com/aalpar/janus/api/v1alpha1
-  version: v1alpha1
-- api:
-    crdVersion: v1
-    namespaced: true
-  controller: true
-  domain: janus.io
-  group: backup
-  kind: Restore
+  kind: Transaction
   path: github.com/aalpar/janus/api/v1alpha1
   version: v1alpha1
 version: "3"

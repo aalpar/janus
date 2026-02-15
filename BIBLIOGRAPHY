@@ -1,0 +1,37 @@
+Atomic Commitment Protocols — Foundational References
+======================================================
+
+Gray, J. (1978). "Notes on Data Base Operating Systems." In: Bayer, R.,
+    Graham, R.M., Seegmuller, G. (eds) Operating Systems: An Advanced
+    Course. Lecture Notes in Computer Science, vol 60. Springer, Berlin,
+    Heidelberg. pp. 393-481.
+
+Lampson, B. and Sturgis, H. (1979). "Crash Recovery in a Distributed
+    Data Storage System." Xerox Palo Alto Research Center, Technical
+    Report.
+
+Skeen, D. (1981). "Nonblocking Commit Protocols." Proceedings of the
+    1981 ACM SIGMOD International Conference on Management of Data,
+    pp. 133-142.
+
+Bernstein, P.A., Hadzilacos, V., and Goodman, N. (1987). "Concurrency
+    Control and Recovery in Database Systems." Addison-Wesley.
+    Chapter 7: Distributed Commit.
+
+Gray, J. and Reuter, A. (1993). "Transaction Processing: Concepts and
+    Techniques." Morgan Kaufmann Publishers. ISBN 1-55860-190-2.
+
+Garcia-Molina, H. and Salem, K. (1987). "Sagas." Proceedings of the
+    1987 ACM SIGMOD International Conference on Management of Data,
+    pp. 249-259.
+
+Guerraoui, R. and Schiper, A. (1995). "The Decentralized Non-Blocking
+    Atomic Commitment Protocol." Proceedings of the 7th IEEE Symposium
+    on Parallel and Distributed Processing, pp. 2-9.
+
+Babaoglu, O. and Toueg, S. (1993). "Understanding Non-Blocking Atomic
+    Commitment." In: Mullender, S. (ed) Distributed Systems, 2nd ed.
+    Addison-Wesley. pp. 147-168.
+
+Gray, J. and Lamport, L. (2006). "Consensus on Transaction Commit."
+    ACM Transactions on Database Systems, vol 31, no 1, pp. 133-160.

@@ -1,121 +1,133 @@
-# janus
-// TODO(user): Add simple overview of use/purpose
+# Janus
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that executes atomic multi-resource changes using the
+[Saga pattern](https://dl.acm.org/doi/10.1145/38714.38742) with
+Lease-based advisory locking.
+
+## How It Works
+
+Janus defines a single CRD — `Transaction` — containing an ordered list of
+resource mutations (create, update, patch, delete). The controller processes
+them as a Saga: each step is paired with a compensating action so the entire
+sequence can be rolled back on failure.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Transaction CR                                          │
+│  spec.changes: [{target, type, content}, ...]            │
+└────────────────────────┬─────────────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│  TransactionReconciler (state machine)                   │
+│                                                          │
+│  Pending ──► Preparing ──► Prepared ──► Committing       │
+│                                           │     │        │
+│                                           │     ▼        │
+│                                           │  Committed   │
+│                                           ▼              │
+│                                      RollingBack         │
+│                                        │     │           │
+│                                        ▼     ▼           │
+│                                   RolledBack Failed      │
+└────────────┬─────────────────────────────────────────────┘
+             │ uses
+             ▼
+┌──────────────────────────────────────────────────────────┐
+│  Lock Manager (internal/lock)                            │
+│  Acquire/Release Lease objects (coordination.k8s.io/v1)  │
+│  Advisory: available to all, enforced by convention      │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Prepare phase** — For each resource: acquire a Lease lock, read current
+state into a rollback ConfigMap. This builds the compensating actions the
+Saga needs if it must abort.
+
+**Commit phase** — For each resource: verify the lock is still held, apply
+the mutation. If any step fails, the Saga reverses through committed items
+in reverse order, restoring each from the rollback ConfigMap.
+
+One item is processed per reconcile cycle. Progress is persisted to the API
+server after each item, so the controller can resume from where it left off
+after a crash.
+
+## Example
+
+```yaml
+apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: deploy-v2
+spec:
+  lockTimeout: 5m
+  changes:
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: app-config
+      type: Patch
+      content:
+        data:
+          version: "2.0"
+
+    - target:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: web-server
+      type: Patch
+      content:
+        spec:
+          template:
+            spec:
+              containers:
+                - name: web
+                  image: myapp:v2.0
+
+    - target:
+        apiVersion: v1
+        kind: Secret
+        name: old-api-key
+      type: Delete
+```
+
+If the Deployment patch fails, the ConfigMap patch is automatically reverted
+to its prior state.
 
 ## Getting Started
 
 ### Prerequisites
 - go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- docker version 17.03+
+- kubectl version v1.11.3+
+- Access to a Kubernetes v1.11.3+ cluster
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+### Deploy
 
 ```sh
 make docker-build docker-push IMG=<some-registry>/janus:tag
-```
-
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
 make install
-```
-
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
 make deploy IMG=<some-registry>/janus:tag
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+### Try it out
 
 ```sh
 kubectl apply -k config/samples/
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+### Uninstall
 
 ```sh
 kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
 make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
 make undeploy
 ```
 
-## Project Distribution
+## References
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/janus:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/janus/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+See [BIBLIOGRAPHY](BIBLIOGRAPHY) for the foundational papers on Sagas,
+two-phase commit, and atomic commitment protocols.
 
 ## License
 
@@ -132,4 +144,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-

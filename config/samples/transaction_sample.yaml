@@ -1,0 +1,47 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: multi-resource-txn
+  namespace: default
+spec:
+  lockTimeout: 5m
+  changes:
+    # 1. Update a ConfigMap
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: app-config
+        namespace: default
+      type: Update
+      content:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: app-config
+          namespace: default
+        data:
+          database_url: "postgres://db:5432/myapp"
+          log_level: "info"
+
+    # 2. Patch a Deployment image
+    - target:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: web-server
+        namespace: default
+      type: Patch
+      content:
+        spec:
+          template:
+            spec:
+              containers:
+                - name: web
+                  image: myapp:v2.1.0
+
+    # 3. Delete a stale Secret
+    - target:
+        apiVersion: v1
+        kind: Secret
+        name: old-api-key
+        namespace: default
+      type: Delete

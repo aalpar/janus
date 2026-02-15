@@ -1,7 +1,0 @@
-apiVersion: backup.janus.io/v1alpha1
-kind: Restore
-metadata:
-  name: my-cluster-restore
-  namespace: default
-spec:
-  backupRef: my-cluster-backup

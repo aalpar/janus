@@ -10,47 +10,16 @@ rules:
   - configmaps
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
   - update
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - persistentvolumeclaims
-  verbs:
-  - create
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - get
-  - list
-  - update
-  - watch
-- apiGroups:
   - '*'
   resources:
   - '*'
-  verbs:
-  - create
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - backup.janus.io
-  resources:
-  - backupcontracts
-  - backups
-  - restores
   verbs:
   - create
   - delete
@@ -62,27 +31,38 @@ rules:
 - apiGroups:
   - backup.janus.io
   resources:
-  - backupcontracts/finalizers
-  - backups/finalizers
-  - restores/finalizers
+  - transactions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - backup.janus.io
+  resources:
+  - transactions/finalizers
   verbs:
   - update
 - apiGroups:
   - backup.janus.io
   resources:
-  - backupcontracts/status
-  - backups/status
-  - restores/status
+  - transactions/status
   verbs:
   - get
   - patch
   - update
 - apiGroups:
-  - snapshot.storage.k8s.io
+  - coordination.k8s.io
   resources:
-  - volumesnapshots
+  - leases
   verbs:
   - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
