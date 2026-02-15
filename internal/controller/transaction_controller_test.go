@@ -73,14 +73,14 @@ var _ = Describe("Transaction Controller", func() {
 
 	Context("when creating a Transaction to create a ConfigMap", func() {
 		It("should progress through phases to Committed", func() {
-			cmContent := map[string]interface{}{
+			cmContent := map[string]any{
 				"apiVersion": "v1",
 				"kind":       "ConfigMap",
-				"metadata": map[string]interface{}{
+				"metadata": map[string]any{
 					"name":      "txn-created-cm",
 					"namespace": namespace,
 				},
-				"data": map[string]interface{}{
+				"data": map[string]any{
 					"key": "value",
 				},
 			}
@@ -129,7 +129,7 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(txn.Status.Items[0].Prepared).To(BeTrue())
 
 			// Keep reconciling until committed.
-			for i := 0; i < 10; i++ {
+			for range 10 {
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: txnName, Namespace: namespace}, txn)).To(Succeed())
 				if txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted {
 					break
@@ -166,8 +166,8 @@ var _ = Describe("Transaction Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
 
-			patchContent, err := json.Marshal(map[string]interface{}{
-				"data": map[string]interface{}{
+			patchContent, err := json.Marshal(map[string]any{
+				"data": map[string]any{
 					"original": "modified",
 					"added":    "new-value",
 				},
@@ -195,7 +195,7 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 
 			// Reconcile through all phases.
-			for i := 0; i < 15; i++ {
+			for range 15 {
 				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "update-txn", Namespace: namespace}, txn)).To(Succeed())
 				if txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted {
 					break
@@ -221,14 +221,14 @@ var _ = Describe("Transaction Controller", func() {
 
 	Context("when a transaction has an empty changes list validation", func() {
 		It("should create the Transaction object with changes", func() {
-			cmContent := map[string]interface{}{
+			cmContent := map[string]any{
 				"apiVersion": "v1",
 				"kind":       "ConfigMap",
-				"metadata": map[string]interface{}{
+				"metadata": map[string]any{
 					"name":      "validation-cm",
 					"namespace": namespace,
 				},
-				"data": map[string]interface{}{
+				"data": map[string]any{
 					"test": "data",
 				},
 			}
