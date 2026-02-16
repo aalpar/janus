@@ -537,6 +537,94 @@ spec:
 			kubectlDeleteIgnoreNotFound("configmap", "multi-patch-target", testNS)
 		})
 
+		It("should rollback committed changes when a later item fails", func() {
+			By("creating the prerequisite ConfigMap for patch rollback")
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rollback-patch-target
+  namespace: %s
+data:
+  original: kept
+`, testNS))).To(Succeed())
+
+			txnName := "e2e-rollback"
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  serviceAccountName: %s
+  changes:
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: rollback-patch-target
+      namespace: %s
+    type: Patch
+    content:
+      data:
+        patched: "yes"
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: rollback-created-cm
+      namespace: %s
+    type: Create
+    content:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: rollback-created-cm
+        namespace: %s
+      data:
+        ephemeral: "true"
+  - target:
+      apiVersion: v1
+      kind: Secret
+      name: forbidden-secret
+      namespace: %s
+    type: Create
+    content:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: forbidden-secret
+        namespace: %s
+      stringData:
+        secret-key: secret-val
+`, txnName, testNS, testSA, testNS, testNS, testNS, testNS, testNS))).To(Succeed())
+
+			waitForTransactionPhase(txnName, testNS, "RolledBack")
+
+			By("verifying the patched ConfigMap was reverted to its original state")
+			cmd := exec.Command("kubectl", "get", "configmap", "rollback-patch-target",
+				"-n", testNS, "-o", "jsonpath={.data.original}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("kept"))
+
+			cmd = exec.Command("kubectl", "get", "configmap", "rollback-patch-target",
+				"-n", testNS, "-o", "jsonpath={.data.patched}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(BeEmpty(), "patched key should have been reverted")
+
+			By("verifying the created ConfigMap was deleted by rollback")
+			cmd = exec.Command("kubectl", "get", "configmap", "rollback-created-cm", "-n", testNS)
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "rollback-created-cm should not exist after rollback")
+
+			By("verifying the forbidden Secret was never created")
+			cmd = exec.Command("kubectl", "get", "secret", "forbidden-secret", "-n", testNS)
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "forbidden-secret should not exist")
+
+			kubectlDeleteIgnoreNotFound("transaction", txnName, testNS)
+			kubectlDeleteIgnoreNotFound("configmap", "rollback-patch-target", testNS)
+		})
+
 		It("should fail when referencing a non-existent ServiceAccount", func() {
 			txnName := "e2e-bad-sa"
 			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: backup.janus.io/v1alpha1
