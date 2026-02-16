@@ -24,12 +24,14 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
@@ -40,9 +42,10 @@ const testNamespace = "default"
 
 // fakeLockMgr is a controllable mock for lock.Manager used to trigger rollback paths.
 type fakeLockMgr struct {
-	acquireFn  func(ctx context.Context, key lock.ResourceKey, txnName string, timeout time.Duration) (string, error)
-	releaseFn  func(ctx context.Context, leaseName string) error
-	isHeldByFn func(ctx context.Context, leaseName string, txnName string) (bool, error)
+	acquireFn    func(ctx context.Context, key lock.ResourceKey, txnName string, timeout time.Duration) (string, error)
+	releaseFn    func(ctx context.Context, leaseName string) error
+	releaseAllFn func(ctx context.Context, txnName string, leaseNames []string) error
+	isHeldByFn   func(ctx context.Context, leaseName string, txnName string) (bool, error)
 }
 
 func (f *fakeLockMgr) Acquire(ctx context.Context, key lock.ResourceKey, txnName string, timeout time.Duration) (string, error) {
@@ -60,6 +63,9 @@ func (f *fakeLockMgr) Release(ctx context.Context, leaseName string) error {
 }
 
 func (f *fakeLockMgr) ReleaseAll(ctx context.Context, txnName string, leaseNames []string) error {
+	if f.releaseAllFn != nil {
+		return f.releaseAllFn(ctx, txnName, leaseNames)
+	}
 	return nil
 }
 
@@ -91,11 +97,15 @@ var _ = Describe("Transaction Controller", func() {
 	})
 
 	AfterEach(func() {
-		// Clean up transactions.
+		// Clean up transactions — strip finalizers first so envtest GC can proceed.
 		txnList := &backupv1alpha1.TransactionList{}
 		Expect(k8sClient.List(ctx, txnList, client.InNamespace(namespace))).To(Succeed())
 		for i := range txnList.Items {
-			Expect(k8sClient.Delete(ctx, &txnList.Items[i])).To(Succeed())
+			t := &txnList.Items[i]
+			if controllerutil.RemoveFinalizer(t, finalizerName) {
+				Expect(k8sClient.Update(ctx, t)).To(Succeed())
+			}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, t))).To(Succeed())
 		}
 
 		// Clean up ConfigMaps created by the controller.
@@ -143,8 +153,18 @@ var _ = Describe("Transaction Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 
-			// Reconcile: Pending → Preparing
+			// Reconcile: adds finalizer.
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: txnName, Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: txnName, Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(finalizerName))
+
+			// Reconcile: Pending → Preparing
+			result, err = reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: txnName, Namespace: namespace},
 			})
 			Expect(err).NotTo(HaveOccurred())
@@ -546,8 +566,14 @@ var _ = Describe("Transaction Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 
-			// Pending → Preparing.
+			// Add finalizer.
 			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "lock-fail-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Pending → Preparing.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
 				NamespacedName: types.NamespacedName{Name: "lock-fail-txn", Namespace: namespace},
 			})
 			Expect(err).NotTo(HaveOccurred())
@@ -840,7 +866,7 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(result).To(Equal(ctrl.Result{}))
 		})
 
-		It("should no-op for Failed", func() {
+		It("should no-op for Failed with no un-rolled-back commits", func() {
 			txn := &backupv1alpha1.Transaction{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "terminal-failed",
@@ -990,6 +1016,718 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
 	})
+
+	Context("finalizer lifecycle", func() {
+		It("should add the finalizer on first reconcile", func() {
+			txn := minimalTxn("fin-add")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "fin-add", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fin-add", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(finalizerName))
+		})
+
+		It("should remove the finalizer at terminal states", func() {
+			txn := minimalTxn("fin-terminal")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Add finalizer.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "fin-terminal", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fin-terminal", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(finalizerName))
+
+			// Manually set to Committed.
+			txn.Status.Phase = backupv1alpha1.TransactionPhaseCommitted
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Reconcile: terminal → strip finalizer.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "fin-terminal", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fin-terminal", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
+		})
+
+		It("should release leases on deletion during Preparing", func() {
+			var releasedLeases []string
+			reconciler.LockMgr = &fakeLockMgr{
+				releaseAllFn: func(_ context.Context, _ string, leases []string) error {
+					releasedLeases = leases
+					return nil
+				},
+			}
+
+			txn := minimalTxn("fin-del-prep")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Add finalizer + Pending → Preparing.
+			reconcileToPhase(reconciler, "fin-del-prep", backupv1alpha1.TransactionPhasePreparing)
+
+			// One more reconcile to prepare items (acquire leases).
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "fin-del-prep", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify leases were acquired.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fin-del-prep", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Items[0].LockLease).NotTo(BeEmpty())
+
+			// Delete the transaction — finalizer prevents immediate removal.
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+
+			// Reconcile: handleDeletion → release leases, remove finalizer.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "fin-del-prep", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify leases were released.
+			Expect(releasedLeases).To(HaveLen(1))
+
+			// Object should be gone (finalizer removed → GC).
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "fin-del-prep", Namespace: namespace}, txn)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("should handle deletion of Pending transaction gracefully", func() {
+			reconciler.LockMgr = &fakeLockMgr{}
+
+			txn := minimalTxn("fin-del-pending")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Add finalizer.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "fin-del-pending", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Delete before any leases are acquired.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fin-del-pending", Namespace: namespace}, txn)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+
+			// Reconcile: handleDeletion with no leases.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "fin-del-pending", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Object should be gone.
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "fin-del-pending", Namespace: namespace}, txn)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	Context("idempotent rollback of Delete (re-Create)", func() {
+		It("should succeed when called twice (AlreadyExists on second attempt)", func() {
+			// Create and commit a Delete transaction, then trigger rollback.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "idemp-rb-del-cm",
+					Namespace: namespace,
+				},
+				Data: map[string]string{"key": "value"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			// Build a 2-item transaction: item 0 = Delete (will commit), item 1 = Create (lock fails).
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "idemp-rb-del-blocker", "namespace": namespace},
+				"data":       map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "idemp-rb-del-txn",
+					Namespace: namespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "idemp-rb-del-cm",
+								Namespace:  namespace,
+							},
+							Type: backupv1alpha1.ChangeTypeDelete,
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "idemp-rb-del-blocker",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			// Progress to Committing.
+			reconcileToPhase(reconciler, "idemp-rb-del-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0 (Delete).
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "idemp-rb-del-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Fail item 1's lock check → triggers rollback.
+			reconciler.LockMgr = &fakeLockMgr{
+				isHeldByFn: func(_ context.Context, _ string, _ string) (bool, error) {
+					return false, nil
+				},
+			}
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "idemp-rb-del-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "idemp-rb-del-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Rollback re-Creates the deleted CM. Do one reconcile to rollback item 0.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "idemp-rb-del-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify the CM was re-created.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "idemp-rb-del-cm", Namespace: namespace}, cm)).To(Succeed())
+
+			// Now simulate a crash: reset item 0's RolledBack to false (as if status update failed).
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "idemp-rb-del-txn", Namespace: namespace}, txn)).To(Succeed())
+			txn.Status.Items[0].RolledBack = false
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Second rollback attempt for same item — should succeed (AlreadyExists → nil).
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "idemp-rb-del-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Should still complete to RolledBack.
+			reconcileToPhase(reconciler, "idemp-rb-del-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("idempotent commit Create", func() {
+		It("should succeed when resource already exists from a previous attempt", func() {
+			cmContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "idemp-create-cm", "namespace": namespace},
+				"data":       map[string]any{"k": "v"},
+			}
+			raw, _ := json.Marshal(cmContent)
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "idemp-create-txn",
+					Namespace: namespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "idemp-create-cm",
+							Namespace:  namespace,
+						},
+						Type:    backupv1alpha1.ChangeTypeCreate,
+						Content: runtime.RawExtension{Raw: raw},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Progress to Committing.
+			reconcileToPhase(reconciler, "idemp-create-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Pre-create the ConfigMap to simulate crash-after-create-before-status-update.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "idemp-create-cm",
+					Namespace: namespace,
+				},
+				Data: map[string]string{"k": "v"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			// Reconcile: should not fail despite AlreadyExists.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "idemp-create-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Should progress to Committed.
+			reconcileToPhase(reconciler, "idemp-create-txn", backupv1alpha1.TransactionPhaseCommitted)
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("handleRollingBack retries on failure", func() {
+		It("should stay in RollingBack (not Failed) when applyRollback fails", func() {
+			// Create a CM, commit a Patch, then trigger rollback.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "retry-rb-cm",
+					Namespace: namespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, _ := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "retry-rb-blocker", "namespace": namespace},
+				"data":       map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "retry-rb-txn",
+					Namespace: namespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "retry-rb-cm",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "retry-rb-blocker",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "retry-rb-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "retry-rb-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Trigger rollback by failing item 1 lock check.
+			reconciler.LockMgr = &fakeLockMgr{
+				isHeldByFn: func(_ context.Context, _ string, _ string) (bool, error) {
+					return false, nil
+				},
+			}
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "retry-rb-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "retry-rb-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Corrupt the rollback CM data to force applyRollback to fail.
+			rbCM := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: txn.Status.RollbackRef, Namespace: namespace,
+			}, rbCM)).To(Succeed())
+			// Replace the stored state with invalid JSON.
+			for key := range rbCM.Data {
+				rbCM.Data[key] = "not-json"
+			}
+			Expect(k8sClient.Update(ctx, rbCM)).To(Succeed())
+
+			// Reconcile: rollback should fail but txn should stay in RollingBack.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "retry-rb-txn", Namespace: namespace},
+			})
+			Expect(err).To(HaveOccurred()) // error returned for backoff
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "retry-rb-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+			Expect(txn.Status.Items[0].Error).To(ContainSubstring("rollback failed"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("handleRollingBack with missing rollback ConfigMap", func() {
+		It("should transition to Failed when the rollback CM is missing", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "missing-rbcm-cm",
+					Namespace: namespace,
+				},
+				Data: map[string]string{"key": "val"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, _ := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "missing-rbcm-blocker", "namespace": namespace},
+				"data":       map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "missing-rbcm-txn",
+					Namespace: namespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "missing-rbcm-cm",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "missing-rbcm-blocker",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "missing-rbcm-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "missing-rbcm-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Trigger rollback.
+			reconciler.LockMgr = &fakeLockMgr{
+				isHeldByFn: func(_ context.Context, _ string, _ string) (bool, error) {
+					return false, nil
+				},
+			}
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "missing-rbcm-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "missing-rbcm-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Delete the rollback ConfigMap.
+			rbCM := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: txn.Status.RollbackRef, Namespace: namespace,
+			}, rbCM)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, rbCM)).To(Succeed())
+
+			// Reconcile: missing CM → Failed.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "missing-rbcm-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "missing-rbcm-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("recovery from Failed phase", func() {
+		It("should transition to RollingBack when un-rolled-back commits exist with rollback CM", func() {
+			// Create a target CM.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "recover-cm",
+					Namespace: namespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, _ := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "recover-blocker", "namespace": namespace},
+				"data":       map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "recover-txn",
+					Namespace: namespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "recover-cm",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "recover-blocker",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "recover-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "recover-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Manually set to Failed with un-rolled-back commit (simulates old behavior).
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "recover-txn", Namespace: namespace}, txn)).To(Succeed())
+			txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
+			now := metav1.Now()
+			txn.Status.CompletedAt = &now
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Verify items: item 0 committed but not rolled back.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "recover-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+			Expect(txn.Status.Items[0].RolledBack).To(BeFalse())
+
+			// Reconcile: Failed → RollingBack (recovery).
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "recover-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "recover-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Continue reconciling to RolledBack.
+			reconcileToPhase(reconciler, "recover-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			// Verify rollback restored the original data.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "recover-cm", Namespace: namespace}, cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("original"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("should stay Failed when un-rolled-back commits exist but rollback CM is missing", func() {
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "no-recover-txn",
+					Namespace: namespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "no-recover-cm",
+						},
+						Type:    backupv1alpha1.ChangeTypeCreate,
+						Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"no-recover-cm"}}`)},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Manually set to Failed with un-rolled-back commit and no rollback CM.
+			txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
+			txn.Status.RollbackRef = "no-recover-txn-rollback"
+			txn.Status.Items = []backupv1alpha1.ItemStatus{{
+				Committed:  true,
+				RolledBack: false,
+			}}
+			now := metav1.Now()
+			txn.Status.CompletedAt = &now
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Reconcile: no CM → stays Failed, strips finalizer.
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "no-recover-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "no-recover-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+		})
+	})
+
+	Context("stale error cleared on successful retry", func() {
+		It("should clear item.Error after successful rollback retry", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "stale-err-cm",
+					Namespace: namespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, _ := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "stale-err-blocker", "namespace": namespace},
+				"data":       map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "stale-err-txn",
+					Namespace: namespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "stale-err-cm",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "stale-err-blocker",
+								Namespace:  namespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "stale-err-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "stale-err-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Trigger rollback.
+			reconciler.LockMgr = &fakeLockMgr{
+				isHeldByFn: func(_ context.Context, _ string, _ string) (bool, error) {
+					return false, nil
+				},
+			}
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "stale-err-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Inject a stale error on item 0 (simulates a previously failed rollback attempt).
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "stale-err-txn", Namespace: namespace}, txn)).To(Succeed())
+			txn.Status.Items[0].Error = "rollback failed: transient network error"
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Reconcile: rollback succeeds → error should be cleared.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "stale-err-txn", Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "stale-err-txn", Namespace: namespace}, txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Error).To(BeEmpty())
+			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
 })
 
 // reconcileToPhase drives the reconciler until the transaction reaches the target phase.
@@ -1007,6 +1745,34 @@ func reconcileToPhase(r *TransactionReconciler, name string, target backupv1alph
 	}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, txn)).To(Succeed())
 	Expect(txn.Status.Phase).To(Equal(target))
+}
+
+// minimalTxn creates a Transaction with a single Create-ConfigMap change.
+func minimalTxn(name string) *backupv1alpha1.Transaction {
+	raw, _ := json.Marshal(map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": name + "-cm", "namespace": testNamespace},
+		"data":       map[string]any{"k": "v"},
+	})
+	return &backupv1alpha1.Transaction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: testNamespace,
+		},
+		Spec: backupv1alpha1.TransactionSpec{
+			Changes: []backupv1alpha1.ResourceChange{{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       name + "-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}},
+		},
+	}
 }
 
 // --- cleanForRestore unit tests ---

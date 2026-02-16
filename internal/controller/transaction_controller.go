@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
@@ -41,6 +42,7 @@ const (
 	requeueDelay     = 5 * time.Second
 	defaultTimeout   = 5 * time.Minute
 	rollbackCMSuffix = "-rollback"
+	finalizerName    = "backup.janus.io/lease-cleanup"
 )
 
 // TransactionReconciler reconciles a Transaction object.
@@ -68,12 +70,46 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Terminal states — nothing to do.
+	// Deletion in progress — release leases, remove finalizer.
+	if !txn.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, &txn)
+	}
+
+	// Terminal states — strip finalizer so subsequent deletes are instant.
 	switch txn.Status.Phase {
 	case backupv1alpha1.TransactionPhaseCommitted,
-		backupv1alpha1.TransactionPhaseRolledBack,
-		backupv1alpha1.TransactionPhaseFailed:
+		backupv1alpha1.TransactionPhaseRolledBack:
+		if controllerutil.RemoveFinalizer(&txn, finalizerName) {
+			if err := r.Update(ctx, &txn); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		return ctrl.Result{}, nil
+	case backupv1alpha1.TransactionPhaseFailed:
+		if r.hasUnrolledCommits(&txn) {
+			rbCM := &corev1.ConfigMap{}
+			if err := r.Get(ctx, client.ObjectKey{
+				Name: txn.Status.RollbackRef, Namespace: txn.Namespace,
+			}, rbCM); err == nil {
+				log.Info("recovering failed transaction with un-rolled-back commits")
+				return r.transition(ctx, &txn, backupv1alpha1.TransactionPhaseRollingBack)
+			}
+			log.Info("cannot recover: rollback ConfigMap missing")
+		}
+		if controllerutil.RemoveFinalizer(&txn, finalizerName) {
+			if err := r.Update(ctx, &txn); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Ensure finalizer is present before any work.
+	if controllerutil.AddFinalizer(&txn, finalizerName) {
+		if err := r.Update(ctx, &txn); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
 
 	switch txn.Status.Phase {
@@ -88,6 +124,27 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.handleCommitting(ctx, &txn)
 	case backupv1alpha1.TransactionPhaseRollingBack:
 		return r.handleRollingBack(ctx, &txn)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// handleDeletion runs when a Transaction's DeletionTimestamp is set.
+// It releases held leases (best-effort, Lease TTL as fallback) and removes
+// the finalizer so the object can be garbage collected.
+//
+// This does NOT attempt rollback of partially-committed state — rollback is
+// a business decision the user triggers explicitly via the RollingBack phase.
+func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("handling deletion, releasing locks")
+
+	leaseNames := r.collectLeaseNames(txn)
+	_ = r.LockMgr.ReleaseAll(ctx, txn.Name, leaseNames)
+
+	controllerutil.RemoveFinalizer(txn, finalizerName)
+	if err := r.Update(ctx, txn); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
@@ -243,10 +300,12 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 
 		if err := r.applyRollback(ctx, change, ns, rbCM); err != nil {
 			item.Error = fmt.Sprintf("rollback failed: %v", err)
-			log.Error(err, "rollback failed for item, marking transaction failed", "item", i)
-			return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d rollback failed: %v", i, err))
+			log.Error(err, "rollback failed for item, will retry", "item", i)
+			_ = r.Status().Update(ctx, txn) // persist error for observability
+			return ctrl.Result{}, err       // controller-runtime backoff
 		}
 
+		item.Error = "" // clear stale error from a previous failed attempt
 		item.RolledBack = true
 		log.Info("item rolled back", "item", i, "kind", change.Target.Kind, "name", change.Target.Name)
 
@@ -294,7 +353,13 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 			return err
 		}
 		obj.SetNamespace(namespace)
-		return r.Create(ctx, obj)
+		if err := r.Create(ctx, obj); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return nil // Already created by a previous attempt.
+			}
+			return err
+		}
+		return nil
 
 	case backupv1alpha1.ChangeTypeUpdate:
 		obj, err := r.unmarshalContent(change.Content, change.Target)
@@ -371,7 +436,13 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 			return fmt.Errorf("deserializing rollback: %w", err)
 		}
 		cleanForRestore(obj, namespace)
-		return r.Create(ctx, obj)
+		if err := r.Create(ctx, obj); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return nil // Already restored by a previous attempt.
+			}
+			return err
+		}
+		return nil
 
 	case backupv1alpha1.ChangeTypeUpdate, backupv1alpha1.ChangeTypePatch:
 		// Reverse = restore the previous state.
@@ -389,7 +460,13 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				// Resource was deleted externally — re-create.
-				return r.Create(ctx, obj)
+				if createErr := r.Create(ctx, obj); createErr != nil {
+					if apierrors.IsAlreadyExists(createErr) {
+						return nil
+					}
+					return createErr
+				}
+				return nil
 			}
 			return err
 		}
@@ -493,6 +570,16 @@ func (r *TransactionReconciler) failAndReleaseLocks(ctx context.Context, txn *ba
 	leaseNames := r.collectLeaseNames(txn)
 	_ = r.LockMgr.ReleaseAll(ctx, txn.Name, leaseNames)
 	return r.setFailed(ctx, txn, message)
+}
+
+// hasUnrolledCommits reports whether any items were committed but not yet rolled back.
+func (r *TransactionReconciler) hasUnrolledCommits(txn *backupv1alpha1.Transaction) bool {
+	for _, item := range txn.Status.Items {
+		if item.Committed && !item.RolledBack {
+			return true
+		}
+	}
+	return false
 }
 
 // rollbackKey produces the ConfigMap key for a resource's rollback state.
