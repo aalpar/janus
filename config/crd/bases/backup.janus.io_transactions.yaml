@@ -187,6 +187,9 @@ spec:
                       description: Error records any error encountered during processing
                         of this item.
                       type: string
+                    leaseNamespace:
+                      description: LeaseNamespace is the namespace of the Lease object.
+                      type: string
                     lockLease:
                       description: LockLease is the name of the Lease object used
                         to lock this resource.

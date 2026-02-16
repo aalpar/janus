@@ -36,3 +36,18 @@ type ErrLockExpired struct {
 func (e *ErrLockExpired) Error() string {
 	return fmt.Sprintf("lock lease %s has expired", e.LeaseName)
 }
+
+// LeaseOpError wraps a Kubernetes API error with lease operation context.
+type LeaseOpError struct {
+	Op        string // e.g. "creating", "getting", "deleting", "renewing", "taking over"
+	LeaseName string
+	Err       error
+}
+
+func (e *LeaseOpError) Error() string {
+	return fmt.Sprintf("%s lease %s: %v", e.Op, e.LeaseName, e.Err)
+}
+
+func (e *LeaseOpError) Unwrap() error {
+	return e.Err
+}
