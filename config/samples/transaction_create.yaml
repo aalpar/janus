@@ -1,0 +1,23 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: create-configmap-txn
+  namespace: default
+spec:
+  serviceAccountName: default
+  changes:
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: new-app-config
+        namespace: default
+      type: Create
+      content:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: new-app-config
+          namespace: default
+        data:
+          database_url: "postgres://db:5432/myapp"
+          log_level: "info"

@@ -1,0 +1,20 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: patch-configmap-txn
+  namespace: default
+spec:
+  serviceAccountName: default
+  changes:
+    # Patches an existing ConfigMap using server-side apply.
+    # Only the fields specified in content are merged; existing keys are preserved.
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: app-config
+        namespace: default
+      type: Patch
+      content:
+        data:
+          log_level: "debug"
+          feature_flag: "enabled"

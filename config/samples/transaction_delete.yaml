@@ -1,0 +1,14 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: delete-configmap-txn
+  namespace: default
+spec:
+  serviceAccountName: default
+  changes:
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: stale-config
+        namespace: default
+      type: Delete
