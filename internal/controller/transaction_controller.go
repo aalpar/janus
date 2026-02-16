@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -55,6 +56,9 @@ type TransactionReconciler struct {
 	Mapper   apimeta.RESTMapper
 	LockMgr  lock.Manager
 	Recorder record.EventRecorder
+
+	// impersonatedClients caches impersonating clients keyed by "namespace/saName".
+	impersonatedClients sync.Map
 }
 
 // +kubebuilder:rbac:groups=backup.janus.io,resources=transactions,verbs=get;list;watch;create;update;patch;delete
@@ -120,33 +124,24 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
-	// Validate that the named ServiceAccount exists.
-	var sa corev1.ServiceAccount
-	if err := r.Get(ctx, client.ObjectKey{
-		Namespace: txn.Namespace,
-		Name:      txn.Spec.ServiceAccountName,
-	}, &sa); err != nil {
-		return ctrl.Result{}, r.setFailed(ctx, &txn,
-			fmt.Sprintf("ServiceAccount %q not found in namespace %q: %v",
-				txn.Spec.ServiceAccountName, txn.Namespace, err))
-	}
-
-	// Build an impersonating client for user-resource operations.
-	userClient, err := impersonate.NewClient(r.BaseCfg, r.Scheme, r.Mapper,
-		txn.Namespace, txn.Spec.ServiceAccountName)
-	if err != nil {
-		return ctrl.Result{}, r.setFailed(ctx, &txn,
-			fmt.Sprintf("building impersonating client: %v", err))
-	}
-
+	// Phases that don't need an impersonating client.
 	switch txn.Status.Phase {
 	case "", backupv1alpha1.TransactionPhasePending:
 		return r.handlePending(ctx, &txn)
-	case backupv1alpha1.TransactionPhasePreparing:
-		return r.handlePreparing(ctx, &txn, userClient)
 	case backupv1alpha1.TransactionPhasePrepared:
 		log.Info("all items prepared, transitioning to committing")
 		return r.transition(ctx, &txn, backupv1alpha1.TransactionPhaseCommitting)
+	}
+
+	// Remaining phases operate on user resources — require an impersonating client.
+	userClient, err := r.getImpersonatingClient(ctx, &txn)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	switch txn.Status.Phase {
+	case backupv1alpha1.TransactionPhasePreparing:
+		return r.handlePreparing(ctx, &txn, userClient)
 	case backupv1alpha1.TransactionPhaseCommitting:
 		return r.handleCommitting(ctx, &txn, userClient)
 	case backupv1alpha1.TransactionPhaseRollingBack:
@@ -154,6 +149,34 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// getImpersonatingClient validates the SA and returns a cached impersonating client.
+func (r *TransactionReconciler) getImpersonatingClient(ctx context.Context, txn *backupv1alpha1.Transaction) (client.Client, error) {
+	// Validate that the named ServiceAccount still exists.
+	var sa corev1.ServiceAccount
+	if err := r.Get(ctx, client.ObjectKey{
+		Namespace: txn.Namespace,
+		Name:      txn.Spec.ServiceAccountName,
+	}, &sa); err != nil {
+		return nil, r.setFailed(ctx, txn,
+			fmt.Sprintf("ServiceAccount %q not found in namespace %q: %v",
+				txn.Spec.ServiceAccountName, txn.Namespace, err))
+	}
+
+	key := txn.Namespace + "/" + txn.Spec.ServiceAccountName
+	if cl, ok := r.impersonatedClients.Load(key); ok {
+		return cl.(client.Client), nil
+	}
+
+	cl, err := impersonate.NewClient(r.BaseCfg, r.Scheme, r.Mapper,
+		txn.Namespace, txn.Spec.ServiceAccountName)
+	if err != nil {
+		return nil, r.setFailed(ctx, txn,
+			fmt.Sprintf("building impersonating client: %v", err))
+	}
+	r.impersonatedClients.Store(key, cl)
+	return cl, nil
 }
 
 // handleDeletion runs when a Transaction's DeletionTimestamp is set.

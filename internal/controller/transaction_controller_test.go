@@ -1880,17 +1880,9 @@ var _ = Describe("Transaction Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 
-			// Add finalizer.
-			_, err := reconciler.Reconcile(ctx, ctrl.Request{
-				NamespacedName: types.NamespacedName{Name: "missing-sa-txn", Namespace: testNamespace},
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Should fail due to missing SA.
-			_, err = reconciler.Reconcile(ctx, ctrl.Request{
-				NamespacedName: types.NamespacedName{Name: "missing-sa-txn", Namespace: testNamespace},
-			})
-			Expect(err).NotTo(HaveOccurred()) // setFailed absorbs the error
+			// SA validation now happens in Preparing, so drive through
+			// finalizer + Pending before hitting the missing-SA failure.
+			reconcileToPhase(reconciler, "missing-sa-txn", backupv1alpha1.TransactionPhaseFailed)
 
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "missing-sa-txn", Namespace: testNamespace}, txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
