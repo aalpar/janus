@@ -121,6 +121,8 @@ func main() {
 	if err := (&controller.TransactionReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
+		BaseCfg:  mgr.GetConfig(),
+		Mapper:   mgr.GetRESTMapper(),
 		LockMgr:  &lock.LeaseManager{Client: mgr.GetClient()},
 		Recorder: mgr.GetEventRecorderFor("transaction-controller"),
 	}).SetupWithManager(mgr); err != nil {
