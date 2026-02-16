@@ -1,0 +1,43 @@
+apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: multi-op-txn
+  namespace: default
+spec:
+  serviceAccountName: default
+  lockTimeout: 5m
+  changes:
+    # 1. Create a new ConfigMap
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: new-feature-config
+        namespace: default
+      type: Create
+      content:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: new-feature-config
+          namespace: default
+        data:
+          enabled: "true"
+
+    # 2. Patch an existing ConfigMap
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: app-config
+        namespace: default
+      type: Patch
+      content:
+        data:
+          version: "2.0"
+
+    # 3. Delete a stale ConfigMap
+    - target:
+        apiVersion: v1
+        kind: ConfigMap
+        name: deprecated-config
+        namespace: default
+      type: Delete

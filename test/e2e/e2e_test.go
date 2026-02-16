@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -44,6 +45,12 @@ const metricsServiceName = "janus-controller-manager-metrics-service"
 
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "janus-metrics-binding"
+
+// testNS is the namespace where Transaction e2e test resources are created.
+const testNS = "janus-e2e-test"
+
+// testSA is the ServiceAccount that Transactions impersonate during e2e tests.
+const testSA = "txn-e2e-sa"
 
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
@@ -267,16 +274,307 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
+	})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+	Context("Transaction lifecycle", func() {
+		BeforeAll(func() {
+			By("creating the e2e test namespace")
+			cmd := exec.Command("kubectl", "create", "ns", testNS)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create test namespace")
+
+			By("creating the test ServiceAccount")
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: %s
+  namespace: %s
+`, testSA, testNS))).To(Succeed())
+
+			By("creating RBAC for the test ServiceAccount")
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: txn-e2e-role
+  namespace: %s
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get","list","watch","create","update","patch","delete"]
+`, testNS))).To(Succeed())
+
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: txn-e2e-binding
+  namespace: %s
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: txn-e2e-role
+subjects:
+- kind: ServiceAccount
+  name: %s
+  namespace: %s
+`, testNS, testSA, testNS))).To(Succeed())
+		})
+
+		AfterAll(func() {
+			By("deleting the e2e test namespace")
+			cmd := exec.Command("kubectl", "delete", "ns", testNS, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("should create a ConfigMap via Transaction", func() {
+			txnName := "e2e-create"
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  serviceAccountName: %s
+  changes:
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: created-cm
+      namespace: %s
+    type: Create
+    content:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: created-cm
+        namespace: %s
+      data:
+        key1: val1
+`, txnName, testNS, testSA, testNS, testNS))).To(Succeed())
+
+			waitForTransactionPhase(txnName, testNS, "Committed")
+
+			By("verifying the ConfigMap exists with expected data")
+			cmd := exec.Command("kubectl", "get", "configmap", "created-cm",
+				"-n", testNS, "-o", "jsonpath={.data.key1}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("val1"))
+
+			kubectlDeleteIgnoreNotFound("transaction", txnName, testNS)
+		})
+
+		It("should patch an existing ConfigMap via Transaction", func() {
+			By("creating the prerequisite ConfigMap")
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: patch-target
+  namespace: %s
+data:
+  existing: preserved
+`, testNS))).To(Succeed())
+
+			txnName := "e2e-patch"
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  serviceAccountName: %s
+  changes:
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: patch-target
+      namespace: %s
+    type: Patch
+    content:
+      data:
+        added: new-value
+`, txnName, testNS, testSA, testNS))).To(Succeed())
+
+			waitForTransactionPhase(txnName, testNS, "Committed")
+
+			By("verifying the patch was merged")
+			cmd := exec.Command("kubectl", "get", "configmap", "patch-target",
+				"-n", testNS, "-o", "jsonpath={.data.added}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("new-value"))
+
+			By("verifying existing data was preserved")
+			cmd = exec.Command("kubectl", "get", "configmap", "patch-target",
+				"-n", testNS, "-o", "jsonpath={.data.existing}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("preserved"))
+
+			kubectlDeleteIgnoreNotFound("transaction", txnName, testNS)
+			kubectlDeleteIgnoreNotFound("configmap", "patch-target", testNS)
+		})
+
+		It("should delete an existing ConfigMap via Transaction", func() {
+			By("creating the prerequisite ConfigMap")
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: delete-target
+  namespace: %s
+data:
+  doomed: "true"
+`, testNS))).To(Succeed())
+
+			txnName := "e2e-delete"
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  serviceAccountName: %s
+  changes:
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: delete-target
+      namespace: %s
+    type: Delete
+`, txnName, testNS, testSA, testNS))).To(Succeed())
+
+			waitForTransactionPhase(txnName, testNS, "Committed")
+
+			By("verifying the ConfigMap is gone")
+			cmd := exec.Command("kubectl", "get", "configmap", "delete-target", "-n", testNS)
+			_, err := utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "ConfigMap should have been deleted")
+
+			kubectlDeleteIgnoreNotFound("transaction", txnName, testNS)
+		})
+
+		It("should handle a multi-item transaction (create + patch + delete)", func() {
+			By("creating prerequisite ConfigMaps")
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multi-patch-target
+  namespace: %s
+data:
+  original: kept
+`, testNS))).To(Succeed())
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multi-delete-target
+  namespace: %s
+data:
+  ephemeral: "true"
+`, testNS))).To(Succeed())
+
+			txnName := "e2e-multi"
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  serviceAccountName: %s
+  changes:
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: multi-create-cm
+      namespace: %s
+    type: Create
+    content:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: multi-create-cm
+        namespace: %s
+      data:
+        created: "true"
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: multi-patch-target
+      namespace: %s
+    type: Patch
+    content:
+      data:
+        patched: "true"
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: multi-delete-target
+      namespace: %s
+    type: Delete
+`, txnName, testNS, testSA, testNS, testNS, testNS, testNS))).To(Succeed())
+
+			waitForTransactionPhase(txnName, testNS, "Committed")
+
+			By("verifying created ConfigMap exists")
+			cmd := exec.Command("kubectl", "get", "configmap", "multi-create-cm",
+				"-n", testNS, "-o", "jsonpath={.data.created}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("true"))
+
+			By("verifying patched ConfigMap has new data")
+			cmd = exec.Command("kubectl", "get", "configmap", "multi-patch-target",
+				"-n", testNS, "-o", "jsonpath={.data.patched}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("true"))
+
+			By("verifying deleted ConfigMap is gone")
+			cmd = exec.Command("kubectl", "get", "configmap", "multi-delete-target", "-n", testNS)
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "ConfigMap should have been deleted")
+
+			kubectlDeleteIgnoreNotFound("transaction", txnName, testNS)
+			kubectlDeleteIgnoreNotFound("configmap", "multi-create-cm", testNS)
+			kubectlDeleteIgnoreNotFound("configmap", "multi-patch-target", testNS)
+		})
+
+		It("should fail when referencing a non-existent ServiceAccount", func() {
+			txnName := "e2e-bad-sa"
+			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: backup.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  serviceAccountName: does-not-exist
+  changes:
+  - target:
+      apiVersion: v1
+      kind: ConfigMap
+      name: irrelevant
+      namespace: %s
+    type: Create
+    content:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: irrelevant
+        namespace: %s
+      data:
+        key: val
+`, txnName, testNS, testNS, testNS))).To(Succeed())
+
+			waitForTransactionPhase(txnName, testNS, "Failed")
+
+			By("verifying the Failed condition is present")
+			cmd := exec.Command("kubectl", "get", "transaction", txnName,
+				"-n", testNS, "-o",
+				`jsonpath={.status.conditions[?(@.type=="Failed")].status}`)
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("True"))
+
+			kubectlDeleteIgnoreNotFound("transaction", txnName, testNS)
+		})
 	})
 })
 
@@ -334,4 +632,30 @@ type tokenRequest struct {
 	Status struct {
 		Token string `json:"token"`
 	} `json:"status"`
+}
+
+// kubectlApplyInput pipes the given YAML to kubectl apply -f -.
+func kubectlApplyInput(yaml string) error {
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(yaml)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+// kubectlDeleteIgnoreNotFound deletes the named resource, ignoring NotFound errors.
+func kubectlDeleteIgnoreNotFound(resource, name, ns string) {
+	cmd := exec.Command("kubectl", "delete", resource, name, "-n", ns, "--ignore-not-found")
+	_, _ = utils.Run(cmd)
+}
+
+// waitForTransactionPhase polls until the Transaction reaches the expected phase or the timeout fires.
+func waitForTransactionPhase(name, ns, phase string) {
+	By(fmt.Sprintf("waiting for Transaction %s/%s to reach phase %s", ns, name, phase))
+	Eventually(func(g Gomega) {
+		cmd := exec.Command("kubectl", "get", "transaction", name,
+			"-n", ns, "-o", "jsonpath={.status.phase}")
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(output).To(Equal(phase))
+	}, 2*time.Minute, time.Second).Should(Succeed())
 }
