@@ -26,6 +26,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,11 +45,12 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var (
-	ctx       context.Context
-	cancel    context.CancelFunc
-	testEnv   *envtest.Environment
-	cfg       *rest.Config
-	k8sClient client.Client
+	ctx        context.Context
+	cancel     context.CancelFunc
+	testEnv    *envtest.Environment
+	cfg        *rest.Config
+	k8sClient  client.Client
+	testMapper meta.RESTMapper
 )
 
 func TestControllers(t *testing.T) {
@@ -84,6 +89,12 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	// Use the k8sClient's RESTMapper — it is discovery-backed via envtest's real API server.
+	testMapper = k8sClient.RESTMapper()
+
+	By("creating test ServiceAccounts and RBAC")
+	createTestRBAC(ctx)
 })
 
 var _ = AfterSuite(func() {
@@ -93,6 +104,60 @@ var _ = AfterSuite(func() {
 		return testEnv.Stop()
 	}, time.Minute, time.Second).Should(Succeed())
 })
+
+// createTestRBAC creates the ServiceAccounts and RBAC resources needed for tests.
+func createTestRBAC(ctx context.Context) {
+	// Privileged SA with ConfigMap CRUD.
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testSAName,
+			Namespace: testNamespace,
+		},
+	}
+	Expect(k8sClient.Create(ctx, sa)).To(Succeed())
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "janus-test-role",
+			Namespace: testNamespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"configmaps"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, role)).To(Succeed())
+
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "janus-test-binding",
+			Namespace: testNamespace,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      testSAName,
+			Namespace: testNamespace,
+		}},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     "janus-test-role",
+		},
+	}
+	Expect(k8sClient.Create(ctx, rb)).To(Succeed())
+
+	// Unprivileged SA with no RBAC bindings.
+	unprivSA := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      unprivSAName,
+			Namespace: testNamespace,
+		},
+	}
+	Expect(k8sClient.Create(ctx, unprivSA)).To(Succeed())
+}
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
 // ENVTEST-based tests depend on specific binaries, usually located in paths set by

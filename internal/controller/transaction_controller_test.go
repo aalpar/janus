@@ -39,7 +39,11 @@ import (
 	"github.com/aalpar/janus/internal/lock"
 )
 
-const testNamespace = "default"
+const (
+	testNamespace = "default"
+	testSAName    = "janus-test-sa"
+	unprivSAName  = "janus-unpriv-sa"
+)
 
 // fakeLockMgr is a controllable mock for lock.Manager used to trigger rollback paths.
 type fakeLockMgr struct {
@@ -92,6 +96,8 @@ var _ = Describe("Transaction Controller", func() {
 		reconciler = &TransactionReconciler{
 			Client:  k8sClient,
 			Scheme:  k8sClient.Scheme(),
+			BaseCfg: cfg,
+			Mapper:  testMapper,
 			LockMgr: &lock.LeaseManager{Client: k8sClient},
 		}
 	})
@@ -147,6 +153,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -244,6 +251,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -305,6 +313,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -339,6 +348,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -392,6 +402,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -454,6 +465,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -560,6 +572,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -633,6 +646,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -731,6 +745,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -816,6 +831,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -851,6 +867,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -881,6 +898,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -934,6 +952,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -1000,6 +1019,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -1162,6 +1182,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -1257,6 +1278,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -1326,6 +1348,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -1430,6 +1453,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -1530,6 +1554,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -1606,6 +1631,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{{
 						Target: backupv1alpha1.ResourceRef{
 							APIVersion: "v1",
@@ -1669,6 +1695,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -1766,6 +1793,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
 					Changes: []backupv1alpha1.ResourceChange{
 						{
 							Target: backupv1alpha1.ResourceRef{
@@ -1829,6 +1857,88 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "renew-cm-2", Namespace: testNamespace}})).To(Succeed())
 		})
 	})
+
+	Context("ServiceAccount impersonation", func() {
+		It("should fail with non-existent SA", func() {
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "missing-sa-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: "does-not-exist",
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "missing-sa-cm",
+						},
+						Type:    backupv1alpha1.ChangeTypeCreate,
+						Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"missing-sa-cm"}}`)},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Add finalizer.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "missing-sa-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Should fail due to missing SA.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "missing-sa-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred()) // setFailed absorbs the error
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "missing-sa-txn", Namespace: testNamespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+			Expect(txn.Status.Conditions).NotTo(BeEmpty())
+			Expect(txn.Status.Conditions[0].Message).To(ContainSubstring("does-not-exist"))
+		})
+
+		It("should fail when SA lacks permissions for the target resource", func() {
+			cmContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "unpriv-cm", "namespace": testNamespace},
+				"data":       map[string]any{"k": "v"},
+			}
+			raw, _ := json.Marshal(cmContent)
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "unpriv-sa-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: unprivSAName,
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "unpriv-cm",
+							Namespace:  testNamespace,
+						},
+						Type:    backupv1alpha1.ChangeTypeCreate,
+						Content: runtime.RawExtension{Raw: raw},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Reconcile to terminal state — the SA has no RBAC so the
+			// commit fails with 403 and triggers rollback. Since the Create
+			// was never applied, rollback succeeds → RolledBack.
+			reconcileToPhase(reconciler, "unpriv-sa-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "unpriv-sa-txn", Namespace: testNamespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			Expect(txn.Status.Items).NotTo(BeEmpty())
+			Expect(txn.Status.Items[0].Error).To(ContainSubstring("forbidden"))
+		})
+	})
 })
 
 // reconcileToPhase drives the reconciler until the transaction reaches the target phase.
@@ -1862,6 +1972,7 @@ func minimalTxn(name string) *backupv1alpha1.Transaction {
 			Namespace: testNamespace,
 		},
 		Spec: backupv1alpha1.TransactionSpec{
+			ServiceAccountName: testSAName,
 			Changes: []backupv1alpha1.ResourceChange{{
 				Target: backupv1alpha1.ResourceRef{
 					APIVersion: "v1",

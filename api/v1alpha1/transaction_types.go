@@ -73,6 +73,10 @@ type ResourceChange struct {
 
 // TransactionSpec defines the desired state of a Transaction.
 type TransactionSpec struct {
+	// ServiceAccountName is the SA whose identity is used for resource operations.
+	// Must exist in the Transaction's namespace.
+	// +kubebuilder:validation:MinLength=1
+	ServiceAccountName string `json:"serviceAccountName"`
 	// Changes is the ordered list of resource mutations to apply atomically.
 	// +kubebuilder:validation:MinItems=1
 	Changes []ResourceChange `json:"changes"`

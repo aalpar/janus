@@ -24,17 +24,12 @@ rules:
   - create
   - patch
 - apiGroups:
-  - '*'
+  - ""
   resources:
-  - '*'
+  - serviceaccounts
   verbs:
-  - create
-  - delete
   - get
-  - list
-  - patch
-  - update
-  - watch
+  - impersonate
 - apiGroups:
   - backup.janus.io
   resources:

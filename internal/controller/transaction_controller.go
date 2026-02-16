@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,6 +37,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
+	"github.com/aalpar/janus/internal/impersonate"
 	"github.com/aalpar/janus/internal/lock"
 )
 
@@ -49,6 +51,8 @@ const (
 type TransactionReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
+	BaseCfg  *rest.Config
+	Mapper   apimeta.RESTMapper
 	LockMgr  lock.Manager
 	Recorder record.EventRecorder
 }
@@ -59,7 +63,7 @@ type TransactionReconciler struct {
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="*",resources="*",verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;impersonate
 
 func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -116,18 +120,37 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
+	// Validate that the named ServiceAccount exists.
+	var sa corev1.ServiceAccount
+	if err := r.Get(ctx, client.ObjectKey{
+		Namespace: txn.Namespace,
+		Name:      txn.Spec.ServiceAccountName,
+	}, &sa); err != nil {
+		return ctrl.Result{}, r.setFailed(ctx, &txn,
+			fmt.Sprintf("ServiceAccount %q not found in namespace %q: %v",
+				txn.Spec.ServiceAccountName, txn.Namespace, err))
+	}
+
+	// Build an impersonating client for user-resource operations.
+	userClient, err := impersonate.NewClient(r.BaseCfg, r.Scheme, r.Mapper,
+		txn.Namespace, txn.Spec.ServiceAccountName)
+	if err != nil {
+		return ctrl.Result{}, r.setFailed(ctx, &txn,
+			fmt.Sprintf("building impersonating client: %v", err))
+	}
+
 	switch txn.Status.Phase {
 	case "", backupv1alpha1.TransactionPhasePending:
 		return r.handlePending(ctx, &txn)
 	case backupv1alpha1.TransactionPhasePreparing:
-		return r.handlePreparing(ctx, &txn)
+		return r.handlePreparing(ctx, &txn, userClient)
 	case backupv1alpha1.TransactionPhasePrepared:
 		log.Info("all items prepared, transitioning to committing")
 		return r.transition(ctx, &txn, backupv1alpha1.TransactionPhaseCommitting)
 	case backupv1alpha1.TransactionPhaseCommitting:
-		return r.handleCommitting(ctx, &txn)
+		return r.handleCommitting(ctx, &txn, userClient)
 	case backupv1alpha1.TransactionPhaseRollingBack:
-		return r.handleRollingBack(ctx, &txn)
+		return r.handleRollingBack(ctx, &txn, userClient)
 	}
 
 	return ctrl.Result{}, nil
@@ -193,7 +216,7 @@ func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1
 }
 
 // handlePreparing acquires locks and records prior state for each resource, one per reconcile.
-func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
+func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backupv1alpha1.Transaction, userClient client.Client) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	timeout := r.lockTimeout(txn)
 
@@ -217,7 +240,7 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 
 		// Read current state and store in rollback ConfigMap.
 		if change.Type != backupv1alpha1.ChangeTypeCreate {
-			obj, err := r.getResource(ctx, change.Target, ns)
+			obj, err := r.getResource(ctx, userClient, change.Target, ns)
 			if err != nil {
 				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: reading current state: %v", i, err))
 			}
@@ -238,7 +261,7 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 }
 
 // handleCommitting applies each mutation, one per reconcile.
-func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
+func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backupv1alpha1.Transaction, userClient client.Client) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	for i, change := range txn.Spec.Changes {
@@ -256,7 +279,7 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 		}
 
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
-		if err := r.applyChange(ctx, change, ns, txn.Name); err != nil {
+		if err := r.applyChange(ctx, userClient, change, ns, txn.Name); err != nil {
 			txn.Status.Items[i].Error = err.Error()
 			log.Error(err, "commit failed, initiating rollback", "item", i)
 			r.event(txn, corev1.EventTypeWarning, "CommitFailed", "item %d: %s %s/%s failed: %v", i, change.Type, change.Target.Kind, change.Target.Name, err)
@@ -291,7 +314,7 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 }
 
 // handleRollingBack reverses committed changes in reverse order, one per reconcile.
-func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
+func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *backupv1alpha1.Transaction, userClient client.Client) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// Load rollback ConfigMap.
@@ -312,7 +335,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		change := txn.Spec.Changes[i]
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 
-		if err := r.applyRollback(ctx, change, ns, rbCM); err != nil {
+		if err := r.applyRollback(ctx, userClient, change, ns, rbCM); err != nil {
 			item.Error = fmt.Sprintf("rollback failed: %v", err)
 			log.Error(err, "rollback failed for item, will retry", "item", i)
 			r.event(txn, corev1.EventTypeWarning, "RollbackFailed", "item %d: rollback failed for %s/%s, will retry: %v", i, change.Target.Kind, change.Target.Name, err)
@@ -344,8 +367,8 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 
 // --- Resource operations ---
 
-// getResource fetches a resource by its ResourceRef.
-func (r *TransactionReconciler) getResource(ctx context.Context, ref backupv1alpha1.ResourceRef, namespace string) (*unstructured.Unstructured, error) {
+// getResource fetches a resource by its ResourceRef using the given client.
+func (r *TransactionReconciler) getResource(ctx context.Context, cl client.Client, ref backupv1alpha1.ResourceRef, namespace string) (*unstructured.Unstructured, error) {
 	obj := &unstructured.Unstructured{}
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
 	if err != nil {
@@ -357,7 +380,7 @@ func (r *TransactionReconciler) getResource(ctx context.Context, ref backupv1alp
 		Kind:    ref.Kind,
 	})
 
-	if err := r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, obj); err != nil {
+	if err := cl.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, obj); err != nil {
 		return nil, err
 	}
 	return obj, nil
@@ -365,7 +388,7 @@ func (r *TransactionReconciler) getResource(ctx context.Context, ref backupv1alp
 
 // applyChange dispatches the appropriate mutation for a ResourceChange.
 // txnName is used as the field manager identity for server-side apply patches.
-func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1alpha1.ResourceChange, namespace, txnName string) error {
+func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace, txnName string) error {
 	switch change.Type {
 	case backupv1alpha1.ChangeTypeCreate:
 		obj, err := r.unmarshalContent(change.Content, change.Target)
@@ -373,7 +396,7 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 			return err
 		}
 		obj.SetNamespace(namespace)
-		if err := r.Create(ctx, obj); err != nil {
+		if err := cl.Create(ctx, obj); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				return nil // Already created by a previous attempt.
 			}
@@ -388,12 +411,12 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 		}
 		obj.SetNamespace(namespace)
 		// Fetch current resourceVersion for the update.
-		existing, err := r.getResource(ctx, change.Target, namespace)
+		existing, err := r.getResource(ctx, cl, change.Target, namespace)
 		if err != nil {
 			return &ResourceOpError{Op: "fetching for update", Err: err}
 		}
 		obj.SetResourceVersion(existing.GetResourceVersion())
-		return r.Update(ctx, obj)
+		return cl.Update(ctx, obj)
 
 	case backupv1alpha1.ChangeTypePatch:
 		// Server-side apply: Janus owns only the fields specified in the patch.
@@ -412,17 +435,17 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
 		})
 		ac := client.ApplyConfigurationFromUnstructured(obj)
-		return r.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
+		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
 
 	case backupv1alpha1.ChangeTypeDelete:
-		existing, err := r.getResource(ctx, change.Target, namespace)
+		existing, err := r.getResource(ctx, cl, change.Target, namespace)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil // Already gone.
 			}
 			return &ResourceOpError{Op: "fetching for delete", Err: err}
 		}
-		return r.Delete(ctx, existing)
+		return cl.Delete(ctx, existing)
 
 	default:
 		return fmt.Errorf("%w: %s", errUnknownChangeType, change.Type)
@@ -430,20 +453,20 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 }
 
 // applyRollback reverses a committed change using the stored prior state.
-func (r *TransactionReconciler) applyRollback(ctx context.Context, change backupv1alpha1.ResourceChange, namespace string, rbCM *corev1.ConfigMap) error {
+func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace string, rbCM *corev1.ConfigMap) error {
 	rbKey := rollbackKey(change.Target, namespace)
 
 	switch change.Type {
 	case backupv1alpha1.ChangeTypeCreate:
 		// Reverse of Create = Delete.
-		existing, err := r.getResource(ctx, change.Target, namespace)
+		existing, err := r.getResource(ctx, cl, change.Target, namespace)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
 			}
 			return err
 		}
-		return r.Delete(ctx, existing)
+		return cl.Delete(ctx, existing)
 
 	case backupv1alpha1.ChangeTypeDelete:
 		// Reverse of Delete = re-Create from rollback state.
@@ -456,7 +479,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 			return &RollbackDataError{Key: rbKey, Err: err}
 		}
 		cleanForRestore(obj, namespace)
-		if err := r.Create(ctx, obj); err != nil {
+		if err := cl.Create(ctx, obj); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				return nil // Already restored by a previous attempt.
 			}
@@ -476,11 +499,11 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 		}
 		cleanForRestore(obj, namespace)
 		// Fetch current resourceVersion for the update.
-		existing, err := r.getResource(ctx, change.Target, namespace)
+		existing, err := r.getResource(ctx, cl, change.Target, namespace)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				// Resource was deleted externally — re-create.
-				if createErr := r.Create(ctx, obj); createErr != nil {
+				if createErr := cl.Create(ctx, obj); createErr != nil {
 					if apierrors.IsAlreadyExists(createErr) {
 						return nil
 					}
@@ -491,7 +514,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 			return err
 		}
 		obj.SetResourceVersion(existing.GetResourceVersion())
-		return r.Update(ctx, obj)
+		return cl.Update(ctx, obj)
 
 	default:
 		return fmt.Errorf("%w for rollback: %s", errUnknownChangeType, change.Type)

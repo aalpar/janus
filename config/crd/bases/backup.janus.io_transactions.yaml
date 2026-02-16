@@ -104,8 +104,15 @@ spec:
                   LockTimeout is how long acquired locks are held before expiring.
                   Defaults to 5 minutes.
                 type: string
+              serviceAccountName:
+                description: |-
+                  ServiceAccountName is the SA whose identity is used for resource operations.
+                  Must exist in the Transaction's namespace.
+                minLength: 1
+                type: string
             required:
             - changes
+            - serviceAccountName
             type: object
           status:
             description: TransactionStatus defines the observed state of a Transaction.
