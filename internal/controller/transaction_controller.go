@@ -48,6 +48,14 @@ const (
 	finalizerName    = "backup.janus.io/lease-cleanup"
 )
 
+// cachedClient holds a lazily-initialized impersonating client.
+// sync.Once ensures exactly one goroutine creates the client; others wait.
+type cachedClient struct {
+	once sync.Once
+	cl   client.Client
+	err  error
+}
+
 // TransactionReconciler reconciles a Transaction object.
 type TransactionReconciler struct {
 	client.Client
@@ -58,7 +66,8 @@ type TransactionReconciler struct {
 	Recorder record.EventRecorder
 
 	// impersonatedClients caches impersonating clients keyed by "namespace/saName".
-	impersonatedClients sync.Map
+	// Entries are evicted when SA validation fails (SA deleted/not found).
+	impersonatedClients sync.Map // → *cachedClient
 }
 
 // +kubebuilder:rbac:groups=backup.janus.io,resources=transactions,verbs=get;list;watch;create;update;patch;delete
@@ -153,30 +162,33 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 // getImpersonatingClient validates the SA and returns a cached impersonating client.
 func (r *TransactionReconciler) getImpersonatingClient(ctx context.Context, txn *backupv1alpha1.Transaction) (client.Client, error) {
+	key := txn.Namespace + "/" + txn.Spec.ServiceAccountName
+
 	// Validate that the named ServiceAccount still exists.
+	// On failure, evict the cache entry so a recreated SA gets a fresh client.
 	var sa corev1.ServiceAccount
 	if err := r.Get(ctx, client.ObjectKey{
 		Namespace: txn.Namespace,
 		Name:      txn.Spec.ServiceAccountName,
 	}, &sa); err != nil {
+		r.impersonatedClients.Delete(key)
 		return nil, r.setFailed(ctx, txn,
 			fmt.Sprintf("ServiceAccount %q not found in namespace %q: %v",
 				txn.Spec.ServiceAccountName, txn.Namespace, err))
 	}
 
-	key := txn.Namespace + "/" + txn.Spec.ServiceAccountName
-	if cl, ok := r.impersonatedClients.Load(key); ok {
-		return cl.(client.Client), nil
-	}
-
-	cl, err := impersonate.NewClient(r.BaseCfg, r.Scheme, r.Mapper,
-		txn.Namespace, txn.Spec.ServiceAccountName)
-	if err != nil {
+	val, _ := r.impersonatedClients.LoadOrStore(key, &cachedClient{})
+	entry := val.(*cachedClient)
+	entry.once.Do(func() {
+		entry.cl, entry.err = impersonate.NewClient(r.BaseCfg, r.Scheme, r.Mapper,
+			txn.Namespace, txn.Spec.ServiceAccountName)
+	})
+	if entry.err != nil {
+		r.impersonatedClients.Delete(key)
 		return nil, r.setFailed(ctx, txn,
-			fmt.Sprintf("building impersonating client: %v", err))
+			fmt.Sprintf("building impersonating client: %v", entry.err))
 	}
-	r.impersonatedClients.Store(key, cl)
-	return cl, nil
+	return entry.cl, nil
 }
 
 // handleDeletion runs when a Transaction's DeletionTimestamp is set.
