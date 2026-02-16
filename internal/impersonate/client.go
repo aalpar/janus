@@ -34,6 +34,10 @@ func NewClient(baseCfg *rest.Config, scheme *runtime.Scheme, mapper meta.RESTMap
 	cfg := rest.CopyConfig(baseCfg)
 	cfg.Impersonate = rest.ImpersonationConfig{
 		UserName: fmt.Sprintf("system:serviceaccount:%s:%s", namespace, saName),
+		Groups: []string{
+			"system:serviceaccounts",
+			fmt.Sprintf("system:serviceaccounts:%s", namespace),
+		},
 	}
 
 	return client.New(cfg, client.Options{
