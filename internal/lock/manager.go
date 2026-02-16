@@ -35,6 +35,12 @@ type ResourceKey struct {
 	Name      string
 }
 
+// LeaseRef identifies a Lease object by name and namespace.
+type LeaseRef struct {
+	Name      string
+	Namespace string
+}
+
 // Manager manages Lease-based advisory locks for transaction resources.
 type Manager interface {
 	// Acquire creates or takes over a Lease lock for the given resource.
@@ -42,13 +48,14 @@ type Manager interface {
 	Acquire(ctx context.Context, key ResourceKey, txnName string, timeout time.Duration) (string, error)
 
 	// Release deletes a single Lease lock.
-	Release(ctx context.Context, leaseName string) error
+	Release(ctx context.Context, lease LeaseRef) error
 
 	// ReleaseAll releases multiple leases, returning the first error encountered.
-	ReleaseAll(ctx context.Context, txnName string, leaseNames []string) error
+	ReleaseAll(ctx context.Context, leases []LeaseRef) error
 
-	// IsHeldBy checks whether the named Lease is held by the given transaction.
-	IsHeldBy(ctx context.Context, leaseName string, txnName string) (bool, error)
+	// Renew extends the lease duration for a lock held by the given transaction.
+	// Returns an error if the lease is not found, expired, or held by a different transaction.
+	Renew(ctx context.Context, lease LeaseRef, txnName string, timeout time.Duration) error
 }
 
 // LeaseManager implements Manager using coordination.k8s.io/v1 Lease objects.
@@ -92,12 +99,12 @@ func (m *LeaseManager) Acquire(ctx context.Context, key ResourceKey, txnName str
 			},
 		}
 		if err := m.Client.Create(ctx, lease); err != nil {
-			return "", fmt.Errorf("creating lease %s: %w", name, err)
+			return "", &LeaseOpError{Op: "creating", LeaseName: name, Err: err}
 		}
 		return name, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("getting lease %s: %w", name, err)
+		return "", &LeaseOpError{Op: "getting", LeaseName: name, Err: err}
 	}
 
 	// Lease exists — check holder.
@@ -111,7 +118,7 @@ func (m *LeaseManager) Acquire(ctx context.Context, key ResourceKey, txnName str
 		lease.Spec.RenewTime = &now
 		lease.Spec.LeaseDurationSeconds = &durationSec
 		if err := m.Client.Update(ctx, lease); err != nil {
-			return "", fmt.Errorf("renewing lease %s: %w", name, err)
+			return "", &LeaseOpError{Op: "renewing", LeaseName: name, Err: err}
 		}
 		return name, nil
 	}
@@ -128,75 +135,66 @@ func (m *LeaseManager) Acquire(ctx context.Context, key ResourceKey, txnName str
 	lease.Spec.RenewTime = &now
 	lease.Labels["janus.io/transaction"] = txnName
 	if err := m.Client.Update(ctx, lease); err != nil {
-		return "", fmt.Errorf("taking over expired lease %s: %w", name, err)
+		return "", &LeaseOpError{Op: "taking over expired", LeaseName: name, Err: err}
 	}
 	return name, nil
 }
 
-func (m *LeaseManager) Release(ctx context.Context, leaseName string) error {
-	// We need to find the lease's namespace. List by label since we know the name.
-	lease := &coordinationv1.Lease{}
-	// Try to find and delete. We list across all namespaces with a field selector isn't
-	// available for leases, so we use label-based listing.
-	leaseList := &coordinationv1.LeaseList{}
-	if err := m.Client.List(ctx, leaseList,
-		client.MatchingLabels{"app.kubernetes.io/managed-by": "janus"},
-	); err != nil {
-		return fmt.Errorf("listing leases for release: %w", err)
-	}
-
-	for i := range leaseList.Items {
-		if leaseList.Items[i].Name == leaseName {
-			lease = &leaseList.Items[i]
-			break
+func (m *LeaseManager) Release(ctx context.Context, lease LeaseRef) error {
+	existing := &coordinationv1.Lease{}
+	if err := m.Client.Get(ctx, client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // Already gone.
 		}
+		return &LeaseOpError{Op: "getting", LeaseName: lease.Name, Err: err}
 	}
-	if lease.Name == "" {
-		return nil // Already gone.
-	}
-
-	if err := m.Client.Delete(ctx, lease); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("deleting lease %s: %w", leaseName, err)
+	if err := m.Client.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+		return &LeaseOpError{Op: "deleting", LeaseName: lease.Name, Err: err}
 	}
 	return nil
 }
 
-func (m *LeaseManager) ReleaseAll(ctx context.Context, txnName string, leaseNames []string) error {
+func (m *LeaseManager) ReleaseAll(ctx context.Context, leases []LeaseRef) error {
 	var firstErr error
-	for _, name := range leaseNames {
-		if name == "" {
+	for _, ref := range leases {
+		if ref.Name == "" {
 			continue
 		}
-		if err := m.Release(ctx, name); err != nil && firstErr == nil {
+		if err := m.Release(ctx, ref); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
 }
 
-func (m *LeaseManager) IsHeldBy(ctx context.Context, leaseName string, txnName string) (bool, error) {
-	leaseList := &coordinationv1.LeaseList{}
-	if err := m.Client.List(ctx, leaseList,
-		client.MatchingLabels{
-			"app.kubernetes.io/managed-by": "janus",
-			"janus.io/transaction":         txnName,
-		},
-	); err != nil {
-		return false, fmt.Errorf("listing leases: %w", err)
+func (m *LeaseManager) Renew(ctx context.Context, lease LeaseRef, txnName string, timeout time.Duration) error {
+	existing := &coordinationv1.Lease{}
+	if err := m.Client.Get(ctx, client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return &ErrLockExpired{LeaseName: lease.Name}
+		}
+		return &LeaseOpError{Op: "getting", LeaseName: lease.Name, Err: err}
 	}
 
-	for _, l := range leaseList.Items {
-		if l.Name == leaseName {
-			if l.Spec.HolderIdentity != nil && *l.Spec.HolderIdentity == txnName {
-				if m.isExpired(&l) {
-					return false, &ErrLockExpired{LeaseName: leaseName}
-				}
-				return true, nil
-			}
-			return false, nil
-		}
+	holder := ""
+	if existing.Spec.HolderIdentity != nil {
+		holder = *existing.Spec.HolderIdentity
 	}
-	return false, nil
+	if holder != txnName {
+		return &ErrAlreadyLocked{LeaseName: lease.Name, Holder: holder}
+	}
+	if m.isExpired(existing) {
+		return &ErrLockExpired{LeaseName: lease.Name}
+	}
+
+	now := metav1.NewMicroTime(time.Now())
+	durationSec := int32(timeout.Seconds())
+	existing.Spec.RenewTime = &now
+	existing.Spec.LeaseDurationSeconds = &durationSec
+	if err := m.Client.Update(ctx, existing); err != nil {
+		return &LeaseOpError{Op: "renewing", LeaseName: lease.Name, Err: err}
+	}
+	return nil
 }
 
 func (m *LeaseManager) isExpired(lease *coordinationv1.Lease) bool {

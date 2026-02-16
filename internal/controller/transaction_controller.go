@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -39,7 +40,6 @@ import (
 )
 
 const (
-	requeueDelay     = 5 * time.Second
 	defaultTimeout   = 5 * time.Minute
 	rollbackCMSuffix = "-rollback"
 	finalizerName    = "backup.janus.io/lease-cleanup"
@@ -48,8 +48,9 @@ const (
 // TransactionReconciler reconciles a Transaction object.
 type TransactionReconciler struct {
 	client.Client
-	Scheme  *runtime.Scheme
-	LockMgr lock.Manager
+	Scheme   *runtime.Scheme
+	LockMgr  lock.Manager
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=backup.janus.io,resources=transactions,verbs=get;list;watch;create;update;patch;delete
@@ -57,6 +58,7 @@ type TransactionReconciler struct {
 // +kubebuilder:rbac:groups=backup.janus.io,resources=transactions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="*",resources="*",verbs=get;list;watch;create;update;patch;delete
 
 func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -92,9 +94,11 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				Name: txn.Status.RollbackRef, Namespace: txn.Namespace,
 			}, rbCM); err == nil {
 				log.Info("recovering failed transaction with un-rolled-back commits")
+				r.event(&txn, corev1.EventTypeWarning, "RecoveryInitiated", "recovering failed transaction with un-rolled-back commits")
 				return r.transition(ctx, &txn, backupv1alpha1.TransactionPhaseRollingBack)
 			}
 			log.Info("cannot recover: rollback ConfigMap missing")
+			r.event(&txn, corev1.EventTypeWarning, "RecoveryBlocked", "cannot recover: rollback ConfigMap %q missing", txn.Status.RollbackRef)
 		}
 		if controllerutil.RemoveFinalizer(&txn, finalizerName) {
 			if err := r.Update(ctx, &txn); err != nil {
@@ -109,7 +113,7 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := r.Update(ctx, &txn); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: requeueDelay}, nil
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
 	switch txn.Status.Phase {
@@ -139,8 +143,10 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 	log := logf.FromContext(ctx)
 	log.Info("handling deletion, releasing locks")
 
-	leaseNames := r.collectLeaseNames(txn)
-	_ = r.LockMgr.ReleaseAll(ctx, txn.Name, leaseNames)
+	leaseRefs := r.collectLeaseRefs(txn)
+	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		log.Error(err, "best-effort lease release failed during deletion")
+	}
 
 	controllerutil.RemoveFinalizer(txn, finalizerName)
 	if err := r.Update(ctx, txn); err != nil {
@@ -154,6 +160,7 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	log.Info("initializing transaction", "changes", len(txn.Spec.Changes))
+	r.event(txn, corev1.EventTypeNormal, "Initializing", "starting transaction with %d changes", len(txn.Spec.Changes))
 
 	now := metav1.Now()
 	txn.Status.StartedAt = &now
@@ -202,9 +209,11 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 		leaseName, err := r.LockMgr.Acquire(ctx, key, txn.Name, timeout)
 		if err != nil {
 			log.Error(err, "lock acquisition failed", "item", i, "resource", key)
+			r.event(txn, corev1.EventTypeWarning, "LockFailed", "item %d: lock acquisition failed for %s/%s: %v", i, change.Target.Kind, change.Target.Name, err)
 			return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d lock failed: %v", i, err))
 		}
 		txn.Status.Items[i].LockLease = leaseName
+		txn.Status.Items[i].LeaseNamespace = ns
 
 		// Read current state and store in rollback ConfigMap.
 		if change.Type != backupv1alpha1.ChangeTypeCreate {
@@ -237,14 +246,12 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 			continue
 		}
 
-		// Verify lock is still held.
-		held, err := r.LockMgr.IsHeldBy(ctx, txn.Status.Items[i].LockLease, txn.Name)
-		if err != nil || !held {
-			msg := fmt.Sprintf("item %d: lock no longer held", i)
-			if err != nil {
-				msg = fmt.Sprintf("item %d: lock check failed: %v", i, err)
-			}
-			log.Error(fmt.Errorf("lock lost"), msg)
+		// Renew the lock to prevent expiry during long commit phases.
+		timeout := r.lockTimeout(txn)
+		leaseRef := lock.LeaseRef{Name: txn.Status.Items[i].LockLease, Namespace: txn.Status.Items[i].LeaseNamespace}
+		if err := r.LockMgr.Renew(ctx, leaseRef, txn.Name, timeout); err != nil {
+			log.Error(err, "lock renewal failed, initiating rollback", "item", i)
+			r.event(txn, corev1.EventTypeWarning, "LockRenewalFailed", "item %d: lock renewal failed, initiating rollback: %v", i, err)
 			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 		}
 
@@ -252,24 +259,30 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 		if err := r.applyChange(ctx, change, ns, txn.Name); err != nil {
 			txn.Status.Items[i].Error = err.Error()
 			log.Error(err, "commit failed, initiating rollback", "item", i)
+			r.event(txn, corev1.EventTypeWarning, "CommitFailed", "item %d: %s %s/%s failed: %v", i, change.Type, change.Target.Kind, change.Target.Name, err)
 			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 		}
 
 		txn.Status.Items[i].Committed = true
 		log.Info("item committed", "item", i, "type", change.Type, "kind", change.Target.Kind, "name", change.Target.Name)
+		r.event(txn, corev1.EventTypeNormal, "ItemCommitted", "item %d: %s %s/%s committed", i, change.Type, change.Target.Kind, change.Target.Name)
 
 		return r.updateStatusAndRequeue(ctx, txn)
 	}
 
 	// All committed — release locks and clean up.
 	log.Info("all items committed, releasing locks")
-	leaseNames := r.collectLeaseNames(txn)
-	_ = r.LockMgr.ReleaseAll(ctx, txn.Name, leaseNames)
+	leaseRefs := r.collectLeaseRefs(txn)
+	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		log.Error(err, "best-effort lease release failed after commit")
+	}
 
 	// Delete rollback ConfigMap — no longer needed.
 	rbCM := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, rbCM); err == nil {
-		_ = r.Delete(ctx, rbCM)
+		if err := r.Delete(ctx, rbCM); err != nil {
+			log.Error(err, "best-effort rollback ConfigMap cleanup failed", "configmap", txn.Status.RollbackRef)
+		}
 	}
 
 	now := metav1.Now()
@@ -285,6 +298,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 	rbCM := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, rbCM); err != nil {
 		log.Error(err, "rollback ConfigMap not found, marking failed")
+		r.event(txn, corev1.EventTypeWarning, "RollbackConfigMapMissing", "rollback ConfigMap %q not found", txn.Status.RollbackRef)
 		return ctrl.Result{}, r.setFailed(ctx, txn, fmt.Sprintf("rollback ConfigMap missing: %v", err))
 	}
 
@@ -301,21 +315,27 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		if err := r.applyRollback(ctx, change, ns, rbCM); err != nil {
 			item.Error = fmt.Sprintf("rollback failed: %v", err)
 			log.Error(err, "rollback failed for item, will retry", "item", i)
-			_ = r.Status().Update(ctx, txn) // persist error for observability
-			return ctrl.Result{}, err       // controller-runtime backoff
+			r.event(txn, corev1.EventTypeWarning, "RollbackFailed", "item %d: rollback failed for %s/%s, will retry: %v", i, change.Target.Kind, change.Target.Name, err)
+			if statusErr := r.Status().Update(ctx, txn); statusErr != nil {
+				log.Error(statusErr, "failed to persist rollback error on item status", "item", i)
+			}
+			return ctrl.Result{}, err // controller-runtime backoff
 		}
 
 		item.Error = "" // clear stale error from a previous failed attempt
 		item.RolledBack = true
 		log.Info("item rolled back", "item", i, "kind", change.Target.Kind, "name", change.Target.Name)
+		r.event(txn, corev1.EventTypeNormal, "ItemRolledBack", "item %d: %s/%s rolled back", i, change.Target.Kind, change.Target.Name)
 
 		return r.updateStatusAndRequeue(ctx, txn)
 	}
 
 	// All rolled back — release locks, preserve rollback CM for forensics.
 	log.Info("rollback complete, releasing locks")
-	leaseNames := r.collectLeaseNames(txn)
-	_ = r.LockMgr.ReleaseAll(ctx, txn.Name, leaseNames)
+	leaseRefs := r.collectLeaseRefs(txn)
+	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		log.Error(err, "best-effort lease release failed after rollback")
+	}
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
@@ -329,7 +349,7 @@ func (r *TransactionReconciler) getResource(ctx context.Context, ref backupv1alp
 	obj := &unstructured.Unstructured{}
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
 	if err != nil {
-		return nil, fmt.Errorf("parsing apiVersion %q: %w", ref.APIVersion, err)
+		return nil, &ResourceOpError{Op: "parsing apiVersion", Ref: ref.APIVersion, Err: err}
 	}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   gv.Group,
@@ -370,7 +390,7 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 		// Fetch current resourceVersion for the update.
 		existing, err := r.getResource(ctx, change.Target, namespace)
 		if err != nil {
-			return fmt.Errorf("fetching for update: %w", err)
+			return &ResourceOpError{Op: "fetching for update", Err: err}
 		}
 		obj.SetResourceVersion(existing.GetResourceVersion())
 		return r.Update(ctx, obj)
@@ -386,7 +406,7 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 		obj.SetNamespace(namespace)
 		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
 		if err != nil {
-			return fmt.Errorf("parsing apiVersion for patch: %w", err)
+			return &ResourceOpError{Op: "parsing apiVersion for patch", Ref: change.Target.APIVersion, Err: err}
 		}
 		obj.SetGroupVersionKind(schema.GroupVersionKind{
 			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
@@ -400,12 +420,12 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, change backupv1
 			if apierrors.IsNotFound(err) {
 				return nil // Already gone.
 			}
-			return fmt.Errorf("fetching for delete: %w", err)
+			return &ResourceOpError{Op: "fetching for delete", Err: err}
 		}
 		return r.Delete(ctx, existing)
 
 	default:
-		return fmt.Errorf("unknown change type: %s", change.Type)
+		return fmt.Errorf("%w: %s", errUnknownChangeType, change.Type)
 	}
 }
 
@@ -429,11 +449,11 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 		// Reverse of Delete = re-Create from rollback state.
 		data, ok := rbCM.Data[rbKey]
 		if !ok {
-			return fmt.Errorf("no rollback data for %s", rbKey)
+			return &RollbackDataError{Key: rbKey}
 		}
 		obj := &unstructured.Unstructured{}
 		if err := json.Unmarshal([]byte(data), &obj.Object); err != nil {
-			return fmt.Errorf("deserializing rollback: %w", err)
+			return &RollbackDataError{Key: rbKey, Err: err}
 		}
 		cleanForRestore(obj, namespace)
 		if err := r.Create(ctx, obj); err != nil {
@@ -448,11 +468,11 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 		// Reverse = restore the previous state.
 		data, ok := rbCM.Data[rbKey]
 		if !ok {
-			return fmt.Errorf("no rollback data for %s", rbKey)
+			return &RollbackDataError{Key: rbKey}
 		}
 		obj := &unstructured.Unstructured{}
 		if err := json.Unmarshal([]byte(data), &obj.Object); err != nil {
-			return fmt.Errorf("deserializing rollback: %w", err)
+			return &RollbackDataError{Key: rbKey, Err: err}
 		}
 		cleanForRestore(obj, namespace)
 		// Fetch current resourceVersion for the update.
@@ -474,7 +494,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 		return r.Update(ctx, obj)
 
 	default:
-		return fmt.Errorf("unknown change type for rollback: %s", change.Type)
+		return fmt.Errorf("%w for rollback: %s", errUnknownChangeType, change.Type)
 	}
 }
 
@@ -483,7 +503,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, change backup
 func (r *TransactionReconciler) unmarshalContent(raw runtime.RawExtension, ref backupv1alpha1.ResourceRef) (*unstructured.Unstructured, error) {
 	obj := &unstructured.Unstructured{}
 	if err := json.Unmarshal(raw.Raw, &obj.Object); err != nil {
-		return nil, fmt.Errorf("unmarshaling content for %s/%s: %w", ref.Kind, ref.Name, err)
+		return nil, &ResourceOpError{Op: "unmarshaling content", Ref: ref.Kind + "/" + ref.Name, Err: err}
 	}
 	return obj, nil
 }
@@ -494,12 +514,12 @@ func (r *TransactionReconciler) saveRollbackState(ctx context.Context, txn *back
 
 	data, err := json.Marshal(obj.Object)
 	if err != nil {
-		return fmt.Errorf("serializing rollback state: %w", err)
+		return &ResourceOpError{Op: "serializing rollback state", Err: err}
 	}
 
 	cm := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); err != nil {
-		return fmt.Errorf("fetching rollback ConfigMap: %w", err)
+		return &ResourceOpError{Op: "fetching rollback ConfigMap", Err: err}
 	}
 	if cm.Data == nil {
 		cm.Data = make(map[string]string)
@@ -522,23 +542,28 @@ func (r *TransactionReconciler) lockTimeout(txn *backupv1alpha1.Transaction) tim
 	return defaultTimeout
 }
 
-func (r *TransactionReconciler) collectLeaseNames(txn *backupv1alpha1.Transaction) []string {
-	names := make([]string, 0, len(txn.Status.Items))
+func (r *TransactionReconciler) collectLeaseRefs(txn *backupv1alpha1.Transaction) []lock.LeaseRef {
+	refs := make([]lock.LeaseRef, 0, len(txn.Status.Items))
 	for _, item := range txn.Status.Items {
 		if item.LockLease != "" {
-			names = append(names, item.LockLease)
+			refs = append(refs, lock.LeaseRef{Name: item.LockLease, Namespace: item.LeaseNamespace})
 		}
 	}
-	return names
+	return refs
 }
 
 func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alpha1.Transaction, phase backupv1alpha1.TransactionPhase) (ctrl.Result, error) {
+	eventType := corev1.EventTypeNormal
+	if phase == backupv1alpha1.TransactionPhaseRollingBack || phase == backupv1alpha1.TransactionPhaseFailed {
+		eventType = corev1.EventTypeWarning
+	}
+	r.event(txn, eventType, "PhaseTransition", "transitioning to %s", phase)
 	txn.Status.Phase = phase
 	txn.Status.Version++
 	if err := r.Status().Update(ctx, txn); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: requeueDelay}, nil
+	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
 func (r *TransactionReconciler) updateStatusAndRequeue(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
@@ -546,7 +571,7 @@ func (r *TransactionReconciler) updateStatusAndRequeue(ctx context.Context, txn 
 	if err := r.Status().Update(ctx, txn); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: requeueDelay}, nil
+	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
 func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alpha1.Transaction, message string) error {
@@ -567,9 +592,19 @@ func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alph
 }
 
 func (r *TransactionReconciler) failAndReleaseLocks(ctx context.Context, txn *backupv1alpha1.Transaction, message string) error {
-	leaseNames := r.collectLeaseNames(txn)
-	_ = r.LockMgr.ReleaseAll(ctx, txn.Name, leaseNames)
+	log := logf.FromContext(ctx)
+	leaseRefs := r.collectLeaseRefs(txn)
+	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		log.Error(err, "best-effort lease release failed during failure handling")
+	}
 	return r.setFailed(ctx, txn, message)
+}
+
+// event emits a Kubernetes Event if the recorder is configured.
+func (r *TransactionReconciler) event(txn *backupv1alpha1.Transaction, eventType, reason, messageFmt string, args ...any) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(txn, eventType, reason, messageFmt, args...)
+	}
 }
 
 // hasUnrolledCommits reports whether any items were committed but not yet rolled back.
@@ -583,21 +618,22 @@ func (r *TransactionReconciler) hasUnrolledCommits(txn *backupv1alpha1.Transacti
 }
 
 // rollbackKey produces the ConfigMap key for a resource's rollback state.
-// Uses dots as separators since ConfigMap keys only allow alphanumeric, '-', '_', '.'.
+// Uses underscores as separators — K8s resource names (DNS-1123) and Kind values
+// never contain underscores, so this is collision-free.
 func rollbackKey(ref backupv1alpha1.ResourceRef, namespace string) string {
-	return fmt.Sprintf("%s.%s.%s", ref.Kind, namespace, ref.Name)
+	return fmt.Sprintf("%s_%s_%s", ref.Kind, namespace, ref.Name)
 }
 
-// cleanForRestore strips cluster-assigned metadata from a resource
-// so it can be re-created in the cluster.
+// cleanForRestore strips cluster-assigned metadata from a resource so it can
+// be re-created or updated in the cluster. OwnerReferences and finalizers are
+// preserved — they were part of the original resource state and are needed to
+// maintain GC chains and external controller contracts.
 func cleanForRestore(obj *unstructured.Unstructured, targetNS string) {
 	obj.SetResourceVersion("")
 	obj.SetUID("")
 	obj.SetCreationTimestamp(metav1.Time{})
 	obj.SetGeneration(0)
 	obj.SetManagedFields(nil)
-	obj.SetOwnerReferences(nil)
-	obj.SetFinalizers(nil)
 	delete(obj.Object, "status")
 	if targetNS != "" {
 		obj.SetNamespace(targetNS)

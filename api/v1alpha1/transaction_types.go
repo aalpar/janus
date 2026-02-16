@@ -87,6 +87,9 @@ type ItemStatus struct {
 	// LockLease is the name of the Lease object used to lock this resource.
 	// +optional
 	LockLease string `json:"lockLease,omitempty"`
+	// LeaseNamespace is the namespace of the Lease object.
+	// +optional
+	LeaseNamespace string `json:"leaseNamespace,omitempty"`
 	// Prepared indicates whether the resource's prior state has been captured.
 	Prepared bool `json:"prepared"`
 	// Committed indicates whether the mutation has been applied.

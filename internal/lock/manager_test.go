@@ -289,7 +289,7 @@ func TestRelease_DeletesExistingLease(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	if err := m.Release(testCtx, name); err != nil {
+	if err := m.Release(testCtx, LeaseRef{Name: name, Namespace: "default"}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -303,20 +303,20 @@ func TestRelease_DeletesExistingLease(t *testing.T) {
 
 func TestRelease_NoOpWhenAlreadyGone(t *testing.T) {
 	m := newManager()
-	if err := m.Release(testCtx, "nonexistent-lease"); err != nil {
+	if err := m.Release(testCtx, LeaseRef{Name: "nonexistent-lease", Namespace: "default"}); err != nil {
 		t.Fatalf("expected no error for missing lease, got: %v", err)
 	}
 }
 
-func TestRelease_ListError(t *testing.T) {
+func TestRelease_GetError(t *testing.T) {
 	m := newManagerWithInterceptors(interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			return fmt.Errorf("synthetic list error")
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return fmt.Errorf("synthetic get error")
 		},
 	})
 
-	err := m.Release(testCtx, "some-lease")
-	if err == nil || err.Error() != "listing leases for release: synthetic list error" {
+	err := m.Release(testCtx, LeaseRef{Name: "some-lease", Namespace: "default"})
+	if err == nil || err.Error() != "getting lease some-lease: synthetic get error" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -338,7 +338,7 @@ func TestRelease_DeleteError(t *testing.T) {
 		},
 	}, existing)
 
-	err := m.Release(testCtx, name)
+	err := m.Release(testCtx, LeaseRef{Name: name, Namespace: "default"})
 	if err == nil || err.Error() != fmt.Sprintf("deleting lease %s: synthetic delete error", name) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -366,7 +366,10 @@ func TestReleaseAll_MultipleLeasesReleased(t *testing.T) {
 	}
 	m := newManager(leases...)
 
-	err := m.ReleaseAll(testCtx, txnOwner, []string{name1, name2})
+	err := m.ReleaseAll(testCtx, []LeaseRef{
+		{Name: name1, Namespace: "default"},
+		{Name: name2, Namespace: "default"},
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -380,7 +383,7 @@ func TestReleaseAll_MultipleLeasesReleased(t *testing.T) {
 
 func TestReleaseAll_SkipsEmptyNames(t *testing.T) {
 	m := newManager()
-	err := m.ReleaseAll(testCtx, txnOwner, []string{"", "", ""})
+	err := m.ReleaseAll(testCtx, []LeaseRef{{}, {}, {}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -388,25 +391,28 @@ func TestReleaseAll_SkipsEmptyNames(t *testing.T) {
 
 func TestReleaseAll_ReturnsFirstError(t *testing.T) {
 	m := newManagerWithInterceptors(interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			return fmt.Errorf("list error")
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return fmt.Errorf("get error")
 		},
 	})
 
-	err := m.ReleaseAll(testCtx, txnOwner, []string{"lease-a", "lease-b"})
+	err := m.ReleaseAll(testCtx, []LeaseRef{
+		{Name: "lease-a", Namespace: "default"},
+		{Name: "lease-b", Namespace: "default"},
+	})
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if err.Error() != "listing leases for release: list error" {
+	if err.Error() != "getting lease lease-a: get error" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-// --- IsHeldBy ---
+// --- Renew ---
 
-func TestIsHeldBy_HeldByCorrectTxn(t *testing.T) {
+func TestRenew_Success(t *testing.T) {
 	holder := txnOwner
-	dur := int32(3600)
+	dur := int32(300)
 	now := metav1.NewMicroTime(time.Now())
 	name := LeaseName(testKey)
 	existing := &coordinationv1.Lease{
@@ -425,16 +431,37 @@ func TestIsHeldBy_HeldByCorrectTxn(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	held, err := m.IsHeldBy(testCtx, name, txnOwner)
+	ref := LeaseRef{Name: name, Namespace: "default"}
+	err := m.Renew(testCtx, ref, txnOwner, 10*time.Minute)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !held {
-		t.Fatal("expected held=true")
+
+	// Verify RenewTime and LeaseDurationSeconds were updated.
+	lease := &coordinationv1.Lease{}
+	_ = m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease)
+	if *lease.Spec.LeaseDurationSeconds != 600 {
+		t.Fatalf("expected 600s, got %d", *lease.Spec.LeaseDurationSeconds)
+	}
+	if lease.Spec.RenewTime.Time.Before(now.Time) {
+		t.Fatal("expected RenewTime to be updated")
 	}
 }
 
-func TestIsHeldBy_HeldByDifferentTxn(t *testing.T) {
+func TestRenew_NotFound(t *testing.T) {
+	m := newManager()
+
+	err := m.Renew(testCtx, LeaseRef{Name: "nonexistent", Namespace: "default"}, txnOwner, 5*time.Minute)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var expErr *ErrLockExpired
+	if !errors.As(err, &expErr) {
+		t.Fatalf("expected ErrLockExpired, got: %v", err)
+	}
+}
+
+func TestRenew_HeldByOther(t *testing.T) {
 	holder := txnOther
 	dur := int32(3600)
 	now := metav1.NewMicroTime(time.Now())
@@ -444,7 +471,7 @@ func TestIsHeldBy_HeldByDifferentTxn(t *testing.T) {
 			Name: name, Namespace: "default",
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "janus",
-				"janus.io/transaction":         txnOwner, // Label says txn-1 but holder is txn-other.
+				"janus.io/transaction":         txnOwner,
 			},
 		},
 		Spec: coordinationv1.LeaseSpec{
@@ -455,28 +482,20 @@ func TestIsHeldBy_HeldByDifferentTxn(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	held, err := m.IsHeldBy(testCtx, name, txnOwner)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	err := m.Renew(testCtx, LeaseRef{Name: name, Namespace: "default"}, txnOwner, 5*time.Minute)
+	if err == nil {
+		t.Fatal("expected error")
 	}
-	if held {
-		t.Fatal("expected held=false")
+	var alErr *ErrAlreadyLocked
+	if !errors.As(err, &alErr) {
+		t.Fatalf("expected ErrAlreadyLocked, got: %v", err)
 	}
-}
-
-func TestIsHeldBy_LeaseNotFound(t *testing.T) {
-	m := newManager()
-
-	held, err := m.IsHeldBy(testCtx, "nonexistent", txnOwner)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if held {
-		t.Fatal("expected held=false")
+	if alErr.Holder != txnOther {
+		t.Fatalf("unexpected holder: %s", alErr.Holder)
 	}
 }
 
-func TestIsHeldBy_LeaseExpired(t *testing.T) {
+func TestRenew_Expired(t *testing.T) {
 	holder := txnOwner
 	dur := int32(1)
 	past := metav1.NewMicroTime(time.Now().Add(-10 * time.Second))
@@ -497,9 +516,9 @@ func TestIsHeldBy_LeaseExpired(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	held, err := m.IsHeldBy(testCtx, name, txnOwner)
-	if held {
-		t.Fatal("expected held=false")
+	err := m.Renew(testCtx, LeaseRef{Name: name, Namespace: "default"}, txnOwner, 5*time.Minute)
+	if err == nil {
+		t.Fatal("expected error")
 	}
 	var expErr *ErrLockExpired
 	if !errors.As(err, &expErr) {
@@ -507,15 +526,46 @@ func TestIsHeldBy_LeaseExpired(t *testing.T) {
 	}
 }
 
-func TestIsHeldBy_ListError(t *testing.T) {
+func TestRenew_UpdateError(t *testing.T) {
+	holder := txnOwner
+	dur := int32(3600)
+	now := metav1.NewMicroTime(time.Now())
+	name := LeaseName(testKey)
+	existing := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "janus",
+				"janus.io/transaction":         holder,
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &dur,
+			RenewTime:            &now,
+		},
+	}
 	m := newManagerWithInterceptors(interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			return fmt.Errorf("list error")
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			return fmt.Errorf("synthetic update error")
+		},
+	}, existing)
+
+	err := m.Renew(testCtx, LeaseRef{Name: name, Namespace: "default"}, txnOwner, 5*time.Minute)
+	if err == nil || err.Error() != fmt.Sprintf("renewing lease %s: synthetic update error", name) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRenew_GetError(t *testing.T) {
+	m := newManagerWithInterceptors(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return fmt.Errorf("get error")
 		},
 	})
 
-	_, err := m.IsHeldBy(testCtx, "some-lease", txnOwner)
-	if err == nil || err.Error() != "listing leases: list error" {
+	err := m.Renew(testCtx, LeaseRef{Name: "some-lease", Namespace: "default"}, txnOwner, 5*time.Minute)
+	if err == nil || err.Error() != "getting lease some-lease: get error" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
