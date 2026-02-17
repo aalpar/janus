@@ -31,3 +31,7 @@ go.work
 
 # Claude Files
 *.local.md
+.claude/
+
+# Serena Files
+.serena/
