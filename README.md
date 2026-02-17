@@ -20,11 +20,17 @@ Janus provides:
   cycle, persisting status to the API server after each step. A controller
   restart resumes from the last recorded checkpoint.
 - **Advisory resource locking.** Lease objects prevent concurrent transactions
-  from modifying the same resource. Locks expire on timeout so a crashed
-  controller cannot hold resources indefinitely.
+  from modifying the same resource. Locks are renewed before each commit and
+  expire on timeout so a crashed controller cannot hold resources indefinitely.
 - **Automatic rollback.** Prior resource state is captured before mutation and
   stored in an OwnerRef'd ConfigMap. On failure, committed changes are reverted
   in reverse order using the stored state.
+- **ServiceAccount impersonation.** Resource operations execute under a
+  user-specified ServiceAccount identity, enforcing RBAC boundaries per
+  transaction.
+- **Prometheus observability.** Built-in metrics for phase transitions,
+  transaction duration, active transaction counts, per-item operation outcomes,
+  and lock operation outcomes.
 
 ### Non-goals
 
@@ -147,6 +153,7 @@ kind: Transaction
 metadata:
   name: deploy-v2
 spec:
+  serviceAccountName: deploy-sa
   lockTimeout: 5m
   changes:
     - target:
@@ -243,7 +250,7 @@ reconcile()
   │
   ├─ phase == Committing
   │    find first item where committed == false
-  │    verify lock still held
+  │    renew lock (extends TTL for this item)
   │    apply mutation
   │    ├─ success: mark item committed, requeue
   │    └─ failure: phase → RollingBack, requeue
@@ -254,11 +261,17 @@ reconcile()
   │    find first committed && !rolledBack item
   │    restore from rollback ConfigMap
   │    ├─ success: mark item rolledBack, requeue
-  │    └─ failure: phase → Failed (requires manual intervention)
+  │    └─ failure: return error (controller-runtime retries with backoff)
   │    (if all done: release locks, phase → RolledBack)
+  │    (if rollback CM missing: phase → Failed)
   │
-  └─ phase ∈ {Committed, RolledBack, Failed}
-       terminal — no further reconciliation
+  ├─ phase == Failed
+  │    if un-rolled-back commits exist and rollback CM present:
+  │      phase → RollingBack (automatic recovery)
+  │    else: strip finalizer, terminal
+  │
+  └─ phase ∈ {Committed, RolledBack}
+       strip finalizer, terminal — no further reconciliation
 ```
 
 ### Lock manager
@@ -274,16 +287,23 @@ Acquire(key, txnName, timeout)
   ├─ Lease held by other, not expired → ErrAlreadyLocked
   └─ Lease held by other, expired → force-acquire (update holder + times)
 
-IsHeldBy(leaseName, txnName)
-  └─ check holder == txnName && renewTime + duration > now
+Renew(lease, txnName, timeout)
+  │
+  ├─ Lease not found → ErrLockExpired
+  ├─ Lease held by different txn → ErrAlreadyLocked
+  ├─ Lease held by txnName but expired → ErrLockExpired
+  └─ Lease held by txnName and valid → update renewTime + duration
 
-Release(leaseName)
-  └─ delete Lease (idempotent)
+Release(lease)
+  └─ delete Lease (idempotent if already gone)
+
+ReleaseAll(leases)
+  └─ release each lease, return first error encountered
 ```
 
 Labels on each Lease (`app.kubernetes.io/managed-by: janus`,
-`janus.io/transaction: {txnName}`) enable bulk operations — releasing all
-locks for a transaction is a label-filtered list + delete.
+`janus.io/transaction: {txnName}`) enable identification. Bulk release
+iterates the lease refs stored in `status.items[]`.
 
 ### Rollback storage
 
@@ -293,22 +313,69 @@ Transaction is deleted).
 
 | Key format | Value |
 |---|---|
-| `{Kind}.{Namespace}.{Name}` | JSON-serialized resource object |
+| `{Kind}_{Namespace}_{Name}` | JSON-serialized resource object |
+
+Keys use underscores as separators — Kubernetes resource names (DNS-1123)
+and Kind values never contain underscores, so the format is collision-free.
 
 During rollback, stored objects are cleaned of server-set metadata
-(`resourceVersion`, `uid`, `managedFields`, `ownerReferences`) before
-re-creation or update.
+(`resourceVersion`, `uid`, `creationTimestamp`, `generation`, `managedFields`,
+`status`) before re-creation or update. OwnerReferences and finalizers are
+preserved — they were part of the original resource state and are needed to
+maintain GC chains and external controller contracts.
 
 The ConfigMap is deleted on successful commit (no longer needed) and preserved
 on rollback or failure (available for debugging).
 
+### ServiceAccount impersonation
+
+Resource operations (reads during prepare, mutations during commit, restores
+during rollback) execute under the identity of the ServiceAccount named in
+`spec.serviceAccountName`. The controller impersonates this SA via the
+Kubernetes impersonation API, so the SA's RBAC bindings determine what
+resources the transaction can touch. If the SA lacks permission for a
+particular operation, the transaction fails cleanly during commit — and any
+already-committed items are rolled back.
+
+Impersonating clients are cached per `namespace/saName` pair with lazy
+initialization (`sync.Once`). The cache is self-healing: entries are evicted
+when SA validation fails (SA deleted or not found), and a fresh client is
+created on the next transaction that uses that SA.
+
+### Finalizer
+
+Every Transaction gets a `backup.janus.io/lease-cleanup` finalizer before
+any work begins. This ensures that if a Transaction is deleted while leases
+are held, the controller gets a chance to release them. The finalizer is
+stripped once the Transaction reaches a terminal phase (Committed, RolledBack,
+or Failed) so that subsequent deletes are instant.
+
+Deleting a Transaction during an active phase (Preparing, Committing)
+releases leases but does **not** roll back partially committed changes.
+Rollback is a business decision — use the RollingBack phase for explicit
+compensation.
+
+### Metrics
+
+The controller registers Prometheus metrics on the controller-runtime
+metrics registry:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `janus_transaction_phase_transitions_total` | Counter | `from_phase`, `to_phase` | State machine edge traversals |
+| `janus_transaction_duration_seconds` | Histogram | `outcome` | Wall-clock time from start to terminal phase |
+| `janus_transactions_active` | Gauge | `phase` | In-flight transactions per non-terminal phase |
+| `janus_item_operations_total` | Counter | `operation`, `result` | Per-item prepare/commit/rollback outcomes |
+| `janus_lock_operations_total` | Counter | `operation`, `result` | Lock acquire/renew/release outcomes |
+| `janus_transaction_item_count` | Histogram | — | Distribution of items per transaction |
+
 ## Getting Started
 
 ### Prerequisites
-- go version v1.24.6+
+- go version v1.25.0+
 - docker version 17.03+
-- kubectl version v1.11.3+
-- Access to a Kubernetes v1.11.3+ cluster
+- kubectl version v1.30.0+
+- Access to a Kubernetes v1.30.0+ cluster
 
 ### Deploy
 

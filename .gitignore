@@ -29,9 +29,13 @@ go.work
 # Kubeconfig might contain secrets
 *.kubeconfig
 
+# Private files
+private/
+
 # Claude Files
 *.local.md
 .claude/
 
 # Serena Files
 .serena/
+
