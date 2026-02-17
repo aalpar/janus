@@ -663,3 +663,249 @@ func TestErrLockExpired_ErrorsAs(t *testing.T) {
 		t.Fatal("errors.As failed for ErrLockExpired")
 	}
 }
+
+// --- Timeout Edge Cases ---
+
+func TestAcquire_ZeroTimeout(t *testing.T) {
+	m := newManager()
+	name, err := m.Acquire(testCtx, testKey, txnOwner, 0*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error with zero timeout: %v", err)
+	}
+
+	// Verify lease was created with 0-second duration.
+	lease := &coordinationv1.Lease{}
+	if err := m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease); err != nil {
+		t.Fatalf("lease not found: %v", err)
+	}
+	if *lease.Spec.LeaseDurationSeconds != 0 {
+		t.Fatalf("expected 0s duration, got %d", *lease.Spec.LeaseDurationSeconds)
+	}
+}
+
+func TestAcquire_VeryLargeTimeout(t *testing.T) {
+	m := newManager()
+	// 10 years in seconds (87600 hours)
+	largeTimeout := 87600 * time.Hour
+	name, err := m.Acquire(testCtx, testKey, txnOwner, largeTimeout)
+	if err != nil {
+		t.Fatalf("unexpected error with large timeout: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease); err != nil {
+		t.Fatalf("lease not found: %v", err)
+	}
+	expectedSeconds := int32(largeTimeout.Seconds())
+	if *lease.Spec.LeaseDurationSeconds != expectedSeconds {
+		t.Fatalf("expected %d, got %d", expectedSeconds, *lease.Spec.LeaseDurationSeconds)
+	}
+}
+
+func TestAcquire_NegativeTimeout(t *testing.T) {
+	m := newManager()
+	// Negative duration should be converted to a negative int32
+	name, err := m.Acquire(testCtx, testKey, txnOwner, -5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error with negative timeout: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease); err != nil {
+		t.Fatalf("lease not found: %v", err)
+	}
+	if *lease.Spec.LeaseDurationSeconds != -5 {
+		t.Fatalf("expected -5, got %d", *lease.Spec.LeaseDurationSeconds)
+	}
+}
+
+func TestRenew_ZeroTimeout(t *testing.T) {
+	holder := txnOwner
+	dur := int32(300)
+	now := metav1.NewMicroTime(time.Now())
+	name := LeaseName(testKey)
+	existing := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "janus",
+				"janus.io/transaction":         holder,
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &dur,
+			RenewTime:            &now,
+		},
+	}
+	m := newManager(existing)
+
+	ref := LeaseRef{Name: name, Namespace: "default"}
+	err := m.Renew(testCtx, ref, txnOwner, 0*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error with zero timeout: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	_ = m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease)
+	if *lease.Spec.LeaseDurationSeconds != 0 {
+		t.Fatalf("expected 0s, got %d", *lease.Spec.LeaseDurationSeconds)
+	}
+}
+
+func TestRenew_VeryLargeTimeout(t *testing.T) {
+	holder := txnOwner
+	dur := int32(300)
+	now := metav1.NewMicroTime(time.Now())
+	name := LeaseName(testKey)
+	existing := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "janus",
+				"janus.io/transaction":         holder,
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &dur,
+			RenewTime:            &now,
+		},
+	}
+	m := newManager(existing)
+
+	largeTimeout := 87600 * time.Hour
+	ref := LeaseRef{Name: name, Namespace: "default"}
+	err := m.Renew(testCtx, ref, txnOwner, largeTimeout)
+	if err != nil {
+		t.Fatalf("unexpected error with large timeout: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	_ = m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease)
+	expectedSeconds := int32(largeTimeout.Seconds())
+	if *lease.Spec.LeaseDurationSeconds != expectedSeconds {
+		t.Fatalf("expected %d, got %d", expectedSeconds, *lease.Spec.LeaseDurationSeconds)
+	}
+}
+
+// --- Zero-Parameter Edge Cases ---
+
+func TestLeaseName_EmptyNamespace(t *testing.T) {
+	key := ResourceKey{Namespace: "", Kind: "ConfigMap", Name: "my-cm"}
+	name := LeaseName(key)
+	if name != "janus-lock--configmap-my-cm" {
+		t.Fatalf("unexpected lease name with empty namespace: %s", name)
+	}
+}
+
+func TestLeaseName_EmptyKind(t *testing.T) {
+	key := ResourceKey{Namespace: "default", Kind: "", Name: "my-cm"}
+	name := LeaseName(key)
+	if name != "janus-lock-default--my-cm" {
+		t.Fatalf("unexpected lease name with empty kind: %s", name)
+	}
+}
+
+func TestLeaseName_EmptyName(t *testing.T) {
+	key := ResourceKey{Namespace: "default", Kind: "ConfigMap", Name: ""}
+	name := LeaseName(key)
+	if name != "janus-lock-default-configmap-" {
+		t.Fatalf("unexpected lease name with empty name: %s", name)
+	}
+}
+
+func TestLeaseName_AllEmpty(t *testing.T) {
+	key := ResourceKey{Namespace: "", Kind: "", Name: ""}
+	name := LeaseName(key)
+	if name != "janus-lock---" {
+		t.Fatalf("unexpected lease name with all empty: %s", name)
+	}
+}
+
+func TestAcquire_EmptyTransactionName(t *testing.T) {
+	m := newManager()
+	name, err := m.Acquire(testCtx, testKey, "", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error with empty txn name: %v", err)
+	}
+
+	// Verify lease was created with empty holder identity.
+	lease := &coordinationv1.Lease{}
+	if err := m.Client.Get(testCtx, client.ObjectKey{Name: name, Namespace: "default"}, lease); err != nil {
+		t.Fatalf("lease not found: %v", err)
+	}
+	if *lease.Spec.HolderIdentity != "" {
+		t.Fatalf("expected empty holder, got %s", *lease.Spec.HolderIdentity)
+	}
+}
+
+func TestRenew_EmptyTransactionName(t *testing.T) {
+	holder := "" // Empty transaction name
+	dur := int32(300)
+	now := metav1.NewMicroTime(time.Now())
+	name := LeaseName(testKey)
+	existing := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "janus",
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &dur,
+			RenewTime:            &now,
+		},
+	}
+	m := newManager(existing)
+
+	ref := LeaseRef{Name: name, Namespace: "default"}
+	err := m.Renew(testCtx, ref, "", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error with empty txn name: %v", err)
+	}
+}
+
+func TestReleaseAll_EmptySlice(t *testing.T) {
+	m := newManager()
+	// ReleaseAll with empty slice should return no error.
+	err := m.ReleaseAll(testCtx, []LeaseRef{})
+	if err != nil {
+		t.Fatalf("expected no error for empty slice, got: %v", err)
+	}
+}
+
+func TestReleaseAll_MixedEmptyAndNonEmpty(t *testing.T) {
+	key2 := ResourceKey{Namespace: "default", Kind: "Secret", Name: "my-secret"}
+	name2 := LeaseName(key2)
+	leases := []client.Object{
+		&coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name2,
+				Namespace: "default",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "janus"},
+			},
+		},
+	}
+	m := newManager(leases...)
+
+	// Mix of empty refs and valid refs — should skip empties and process valid ones.
+	err := m.ReleaseAll(testCtx, []LeaseRef{
+		{Name: "", Namespace: "default"},
+		{Name: name2, Namespace: "default"},
+		{Name: "", Namespace: ""},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	leaseList := &coordinationv1.LeaseList{}
+	_ = m.Client.List(testCtx, leaseList)
+	if len(leaseList.Items) != 0 {
+		t.Fatalf("expected 0 leases, got %d", len(leaseList.Items))
+	}
+}
