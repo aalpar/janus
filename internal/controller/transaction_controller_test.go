@@ -1967,6 +1967,126 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(txn.Status.Items[0].Error).To(ContainSubstring("forbidden"))
 		})
 	})
+
+	Context("lease expiry and split-brain recovery", func() {
+		It("documents split-brain risk: auto-recovery uses stale rollback state", func() {
+			// VULNERABILITY DOCUMENTATION:
+			// When TxnA fails and its leases expire, TxnB can acquire them.
+			// TxnA's auto-recovery rollback uses ConfigMapA's stale prior-state snapshots,
+			// not the current state that TxnB may have modified. This can corrupt data.
+			//
+			// Example:
+			// 1. TxnA commits: Service replicas 3→5 (saves prior=3)
+			// 2. TxnA commits: Service replicas 5→7 (saves prior=5)
+			// 3. TxnA fails on item 3, leases expire
+			// 4. TxnB takes leases, modifies Service to 8 replicas
+			// 5. TxnA auto-recovers and rolls back using ConfigMapA
+			// 6. TxnA restores item 1 to prior=5 (ConfigMapA's stale value)
+			// 7. Result: Service at 5 replicas, TxnB's change to 8 is lost (split-brain)
+			//
+			// Current mitigation: operational discipline + one-item-per-cycle design
+			// makes window narrow. Better: require explicit rollback trigger.
+
+			// Create target resource.
+			origCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "staledata-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, origCM)).To(Succeed())
+
+			// Create transaction with 2 items.
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "staledata-blocker",
+					"namespace": testNamespace,
+				},
+				"data": map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "staledata-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "staledata-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"txn-a-modified"}}`)},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "staledata-blocker",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Use real lock manager for full transaction execution.
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			// Drive to commit item 0 (saves original state in ConfigMapA).
+			reconcileToPhase(reconciler, "staledata-txn", backupv1alpha1.TransactionPhaseCommitting)
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "staledata-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "staledata-txn", Namespace: testNamespace}, txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+			rbCMName := txn.Status.RollbackRef
+
+			// Verify rollback ConfigMap saved the original state.
+			rbCM := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: testNamespace}, rbCM)).To(Succeed())
+			Expect(rbCM.Data).NotTo(BeEmpty())
+
+			// Manually set to Failed (item 1 failed).
+			txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
+			now := metav1.Now()
+			txn.Status.CompletedAt = &now
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Simulate TxnB modifying the resource while leases were stale.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "staledata-cm", Namespace: testNamespace}, origCM)).To(Succeed())
+			origCM.Data["key"] = "txn-b-modified"
+			Expect(k8sClient.Update(ctx, origCM)).To(Succeed())
+
+			// TxnA auto-recovers and rollbacks using stale ConfigMapA.
+			// The rollback will restore from prior-state (original), losing TxnB's change.
+			reconcileToPhase(reconciler, "staledata-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			// Verify rollback succeeded.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "staledata-txn", Namespace: testNamespace}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+
+			// This is the vulnerability: the resource was rolled back to prior-state (original),
+			// losing TxnB's modification.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "staledata-cm", Namespace: testNamespace}, origCM)).To(Succeed())
+			Expect(origCM.Data["key"]).To(Equal("original"))
+			// TxnB's "txn-b-modified" is gone — split-brain!
+		})
+	})
 })
 
 // reconcileToPhase drives the reconciler until the transaction reaches the target phase.
