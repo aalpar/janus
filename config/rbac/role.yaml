@@ -30,6 +30,8 @@ rules:
   verbs:
   - get
   - impersonate
+  - list
+  - watch
 - apiGroups:
   - backup.janus.io
   resources:

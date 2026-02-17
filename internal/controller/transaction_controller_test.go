@@ -23,6 +23,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,6 +38,7 @@ import (
 
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
 	"github.com/aalpar/janus/internal/lock"
+	txmetrics "github.com/aalpar/janus/internal/metrics"
 )
 
 const (
@@ -100,6 +102,12 @@ var _ = Describe("Transaction Controller", func() {
 			Mapper:  testMapper,
 			LockMgr: &lock.LeaseManager{Client: k8sClient},
 		}
+		txmetrics.PhaseTransitions.Reset()
+		txmetrics.Duration.Reset()
+		txmetrics.ActiveTransactions.Reset()
+		txmetrics.ItemOperations.Reset()
+		txmetrics.LockOperations.Reset()
+		// ItemCount is prometheus.Histogram (interface) — no Reset(). Not asserted in tests.
 	})
 
 	AfterEach(func() {
@@ -214,6 +222,17 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: txnName, Namespace: testNamespace}, txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
 			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Verify metrics.
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Pending", "Preparing"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Preparing", "Prepared"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Prepared", "Committing"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Committing", "Committed"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("prepare", "success"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("commit", "success"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.LockOperations.WithLabelValues("acquire", "success"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.LockOperations.WithLabelValues("renew", "success"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.LockOperations.WithLabelValues("release", "success"))).To(Equal(1.0))
 
 			// Verify the ConfigMap was actually created.
 			cm := &corev1.ConfigMap{}
@@ -538,6 +557,13 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(txn.Status.CompletedAt).NotTo(BeNil())
 			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
 
+			// Verify metrics: commit success for item 0, lock renew error for item 1, rollback success.
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("commit", "success"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.LockOperations.WithLabelValues("renew", "error"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("rollback", "success"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Committing", "RollingBack"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("RollingBack", "RolledBack"))).To(Equal(1.0))
+
 			// Verify the ConfigMap was restored to its original state.
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rb-patch-cm", Namespace: testNamespace}, cm)).To(Succeed())
 			Expect(cm.Data["key"]).To(Equal("original"))
@@ -611,6 +637,11 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(txn.Status.CompletedAt).NotTo(BeNil())
 			Expect(txn.Status.Conditions).NotTo(BeEmpty())
 			Expect(txn.Status.Conditions[0].Type).To(Equal("Failed"))
+
+			// Verify metrics: lock acquire error and prepare error recorded.
+			Expect(testutil.ToFloat64(txmetrics.LockOperations.WithLabelValues("acquire", "error"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("prepare", "error"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Preparing", "Failed"))).To(Equal(1.0))
 		})
 	})
 
@@ -994,6 +1025,11 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(txn.Status.Items).To(HaveLen(2))
 			Expect(txn.Status.Items[0].Committed).To(BeTrue())
 			Expect(txn.Status.Items[1].Committed).To(BeTrue())
+
+			// Verify metrics: 2 prepare successes, 2 commit successes, 2 lock acquires.
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("prepare", "success"))).To(Equal(2.0))
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("commit", "success"))).To(Equal(2.0))
+			Expect(testutil.ToFloat64(txmetrics.LockOperations.WithLabelValues("acquire", "success"))).To(Equal(2.0))
 
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "multi-cm-1", Namespace: testNamespace}})).To(Succeed())

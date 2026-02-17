@@ -37,6 +37,7 @@ import (
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
 	"github.com/aalpar/janus/internal/controller"
 	"github.com/aalpar/janus/internal/lock"
+	_ "github.com/aalpar/janus/internal/metrics" // Register Prometheus metrics.
 	// +kubebuilder:scaffold:imports
 )
 
@@ -119,11 +120,12 @@ func main() {
 	}
 
 	if err := (&controller.TransactionReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		BaseCfg:  mgr.GetConfig(),
-		Mapper:   mgr.GetRESTMapper(),
-		LockMgr:  &lock.LeaseManager{Client: mgr.GetClient()},
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		BaseCfg: mgr.GetConfig(),
+		Mapper:  mgr.GetRESTMapper(),
+		LockMgr: &lock.LeaseManager{Client: mgr.GetClient()},
+		//nolint:staticcheck // TODO: migrate to events.EventRecorder
 		Recorder: mgr.GetEventRecorderFor("transaction-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Transaction")
