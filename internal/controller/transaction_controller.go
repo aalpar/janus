@@ -40,6 +40,7 @@ import (
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
 	"github.com/aalpar/janus/internal/impersonate"
 	"github.com/aalpar/janus/internal/lock"
+	txmetrics "github.com/aalpar/janus/internal/metrics"
 )
 
 const (
@@ -224,6 +225,7 @@ func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1
 	txn.Status.StartedAt = &now
 	txn.Status.Items = make([]backupv1alpha1.ItemStatus, len(txn.Spec.Changes))
 	txn.Status.RollbackRef = txn.Name + rollbackCMSuffix
+	txmetrics.ItemCount.Observe(float64(len(txn.Spec.Changes)))
 
 	// Create the rollback ConfigMap.
 	cm := &corev1.ConfigMap{
@@ -266,10 +268,13 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 		// Acquire lock.
 		leaseName, err := r.LockMgr.Acquire(ctx, key, txn.Name, timeout)
 		if err != nil {
+			txmetrics.LockOperations.WithLabelValues("acquire", "error").Inc()
 			log.Error(err, "lock acquisition failed", "item", i, "resource", key)
 			r.event(txn, corev1.EventTypeWarning, "LockFailed", "item %d: lock acquisition failed for %s/%s: %v", i, change.Target.Kind, change.Target.Name, err)
+			txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
 			return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d lock failed: %v", i, err))
 		}
+		txmetrics.LockOperations.WithLabelValues("acquire", "success").Inc()
 		txn.Status.Items[i].LockLease = leaseName
 		txn.Status.Items[i].LeaseNamespace = ns
 
@@ -277,13 +282,16 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 		if change.Type != backupv1alpha1.ChangeTypeCreate {
 			obj, err := r.getResource(ctx, userClient, change.Target, ns)
 			if err != nil {
+				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
 				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: reading current state: %v", i, err))
 			}
 			if err := r.saveRollbackState(ctx, txn, change, obj); err != nil {
+				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
 				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: saving rollback state: %v", i, err))
 			}
 		}
 
+		txmetrics.ItemOperations.WithLabelValues("prepare", "success").Inc()
 		txn.Status.Items[i].Prepared = true
 		log.Info("item prepared", "item", i, "kind", change.Target.Kind, "name", change.Target.Name)
 
@@ -308,19 +316,23 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 		timeout := r.lockTimeout(txn)
 		leaseRef := lock.LeaseRef{Name: txn.Status.Items[i].LockLease, Namespace: txn.Status.Items[i].LeaseNamespace}
 		if err := r.LockMgr.Renew(ctx, leaseRef, txn.Name, timeout); err != nil {
+			txmetrics.LockOperations.WithLabelValues("renew", "error").Inc()
 			log.Error(err, "lock renewal failed, initiating rollback", "item", i)
 			r.event(txn, corev1.EventTypeWarning, "LockRenewalFailed", "item %d: lock renewal failed, initiating rollback: %v", i, err)
 			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 		}
+		txmetrics.LockOperations.WithLabelValues("renew", "success").Inc()
 
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 		if err := r.applyChange(ctx, userClient, change, ns, txn.Name); err != nil {
+			txmetrics.ItemOperations.WithLabelValues("commit", "error").Inc()
 			txn.Status.Items[i].Error = err.Error()
 			log.Error(err, "commit failed, initiating rollback", "item", i)
 			r.event(txn, corev1.EventTypeWarning, "CommitFailed", "item %d: %s %s/%s failed: %v", i, change.Type, change.Target.Kind, change.Target.Name, err)
 			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 		}
 
+		txmetrics.ItemOperations.WithLabelValues("commit", "success").Inc()
 		txn.Status.Items[i].Committed = true
 		log.Info("item committed", "item", i, "type", change.Type, "kind", change.Target.Kind, "name", change.Target.Name)
 		r.event(txn, corev1.EventTypeNormal, "ItemCommitted", "item %d: %s %s/%s committed", i, change.Type, change.Target.Kind, change.Target.Name)
@@ -332,7 +344,10 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 	log.Info("all items committed, releasing locks")
 	leaseRefs := r.collectLeaseRefs(txn)
 	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		txmetrics.LockOperations.WithLabelValues("release", "error").Add(float64(len(leaseRefs)))
 		log.Error(err, "best-effort lease release failed after commit")
+	} else {
+		txmetrics.LockOperations.WithLabelValues("release", "success").Add(float64(len(leaseRefs)))
 	}
 
 	// Delete rollback ConfigMap — no longer needed.
@@ -345,6 +360,7 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
+	txmetrics.Duration.WithLabelValues("Committed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
 	return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseCommitted)
 }
 
@@ -371,6 +387,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 
 		if err := r.applyRollback(ctx, userClient, change, ns, rbCM); err != nil {
+			txmetrics.ItemOperations.WithLabelValues("rollback", "error").Inc()
 			item.Error = fmt.Sprintf("rollback failed: %v", err)
 			log.Error(err, "rollback failed for item, will retry", "item", i)
 			r.event(txn, corev1.EventTypeWarning, "RollbackFailed", "item %d: rollback failed for %s/%s, will retry: %v", i, change.Target.Kind, change.Target.Name, err)
@@ -380,6 +397,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 			return ctrl.Result{}, err // controller-runtime backoff
 		}
 
+		txmetrics.ItemOperations.WithLabelValues("rollback", "success").Inc()
 		item.Error = "" // clear stale error from a previous failed attempt
 		item.RolledBack = true
 		log.Info("item rolled back", "item", i, "kind", change.Target.Kind, "name", change.Target.Name)
@@ -392,11 +410,15 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 	log.Info("rollback complete, releasing locks")
 	leaseRefs := r.collectLeaseRefs(txn)
 	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		txmetrics.LockOperations.WithLabelValues("release", "error").Add(float64(len(leaseRefs)))
 		log.Error(err, "best-effort lease release failed after rollback")
+	} else {
+		txmetrics.LockOperations.WithLabelValues("release", "success").Add(float64(len(leaseRefs)))
 	}
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
+	txmetrics.Duration.WithLabelValues("RolledBack").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
 	return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRolledBack)
 }
 
@@ -616,6 +638,19 @@ func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alp
 		eventType = corev1.EventTypeWarning
 	}
 	r.event(txn, eventType, "PhaseTransition", "transitioning to %s", phase)
+
+	oldPhase := string(txn.Status.Phase)
+	if oldPhase == "" {
+		oldPhase = "Pending"
+	}
+	txmetrics.PhaseTransitions.WithLabelValues(oldPhase, string(phase)).Inc()
+	if !isTerminalPhase(txn.Status.Phase) && txn.Status.Phase != "" {
+		txmetrics.ActiveTransactions.WithLabelValues(oldPhase).Dec()
+	}
+	if !isTerminalPhase(phase) {
+		txmetrics.ActiveTransactions.WithLabelValues(string(phase)).Inc()
+	}
+
 	txn.Status.Phase = phase
 	txn.Status.Version++
 	if err := r.Status().Update(ctx, txn); err != nil {
@@ -635,6 +670,19 @@ func (r *TransactionReconciler) updateStatusAndRequeue(ctx context.Context, txn 
 func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alpha1.Transaction, message string) error {
 	log := logf.FromContext(ctx)
 	log.Error(fmt.Errorf("transaction failed"), message)
+
+	oldPhase := string(txn.Status.Phase)
+	if oldPhase == "" {
+		oldPhase = "Pending"
+	}
+	txmetrics.PhaseTransitions.WithLabelValues(oldPhase, "Failed").Inc()
+	if !isTerminalPhase(txn.Status.Phase) && txn.Status.Phase != "" {
+		txmetrics.ActiveTransactions.WithLabelValues(oldPhase).Dec()
+	}
+	if txn.Status.StartedAt != nil {
+		txmetrics.Duration.WithLabelValues("Failed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
+	}
+
 	now := metav1.Now()
 	txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
 	txn.Status.CompletedAt = &now
@@ -653,7 +701,10 @@ func (r *TransactionReconciler) failAndReleaseLocks(ctx context.Context, txn *ba
 	log := logf.FromContext(ctx)
 	leaseRefs := r.collectLeaseRefs(txn)
 	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		txmetrics.LockOperations.WithLabelValues("release", "error").Add(float64(len(leaseRefs)))
 		log.Error(err, "best-effort lease release failed during failure handling")
+	} else {
+		txmetrics.LockOperations.WithLabelValues("release", "success").Add(float64(len(leaseRefs)))
 	}
 	return r.setFailed(ctx, txn, message)
 }
@@ -696,6 +747,16 @@ func cleanForRestore(obj *unstructured.Unstructured, targetNS string) {
 	if targetNS != "" {
 		obj.SetNamespace(targetNS)
 	}
+}
+
+func isTerminalPhase(p backupv1alpha1.TransactionPhase) bool {
+	switch p {
+	case backupv1alpha1.TransactionPhaseCommitted,
+		backupv1alpha1.TransactionPhaseRolledBack,
+		backupv1alpha1.TransactionPhaseFailed:
+		return true
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
