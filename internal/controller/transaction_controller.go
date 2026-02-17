@@ -221,11 +221,12 @@ func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1
 	log.Info("initializing transaction", "changes", len(txn.Spec.Changes))
 	r.event(txn, corev1.EventTypeNormal, "Initializing", "starting transaction with %d changes", len(txn.Spec.Changes))
 
+	wasNew := txn.Status.StartedAt == nil
 	now := metav1.Now()
 	txn.Status.StartedAt = &now
 	txn.Status.Items = make([]backupv1alpha1.ItemStatus, len(txn.Spec.Changes))
 	txn.Status.RollbackRef = txn.Name + rollbackCMSuffix
-	if txn.Status.StartedAt == nil {
+	if wasNew {
 		txmetrics.ItemCount.Observe(float64(len(txn.Spec.Changes)))
 	}
 
@@ -346,10 +347,10 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 	log.Info("all items committed, releasing locks")
 	leaseRefs := r.collectLeaseRefs(txn)
 	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
-		txmetrics.LockOperations.WithLabelValues("release", "error").Add(float64(len(leaseRefs)))
+		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
 		log.Error(err, "best-effort lease release failed after commit")
 	} else {
-		txmetrics.LockOperations.WithLabelValues("release", "success").Add(float64(len(leaseRefs)))
+		txmetrics.LockOperations.WithLabelValues("release", "success").Inc()
 	}
 
 	// Delete rollback ConfigMap — no longer needed.
@@ -414,10 +415,10 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 	log.Info("rollback complete, releasing locks")
 	leaseRefs := r.collectLeaseRefs(txn)
 	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
-		txmetrics.LockOperations.WithLabelValues("release", "error").Add(float64(len(leaseRefs)))
+		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
 		log.Error(err, "best-effort lease release failed after rollback")
 	} else {
-		txmetrics.LockOperations.WithLabelValues("release", "success").Add(float64(len(leaseRefs)))
+		txmetrics.LockOperations.WithLabelValues("release", "success").Inc()
 	}
 
 	now := metav1.Now()
@@ -645,13 +646,14 @@ func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alp
 	}
 	r.event(txn, eventType, "PhaseTransition", "transitioning to %s", phase)
 
-	recordPhaseChange(txn.Status.Phase, phase)
-
+	oldPhase := txn.Status.Phase
 	txn.Status.Phase = phase
 	txn.Status.Version++
 	if err := r.Status().Update(ctx, txn); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	recordPhaseChange(oldPhase, phase)
 	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
@@ -667,11 +669,7 @@ func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alph
 	log := logf.FromContext(ctx)
 	log.Error(fmt.Errorf("transaction failed"), message)
 
-	recordPhaseChange(txn.Status.Phase, backupv1alpha1.TransactionPhaseFailed)
-	if txn.Status.StartedAt != nil {
-		txmetrics.Duration.WithLabelValues("Failed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
-	}
-
+	oldPhase := txn.Status.Phase
 	now := metav1.Now()
 	txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
 	txn.Status.CompletedAt = &now
@@ -683,17 +681,25 @@ func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alph
 		Message:            message,
 		LastTransitionTime: now,
 	})
-	return r.Status().Update(ctx, txn)
+	if err := r.Status().Update(ctx, txn); err != nil {
+		return err
+	}
+
+	recordPhaseChange(oldPhase, backupv1alpha1.TransactionPhaseFailed)
+	if txn.Status.StartedAt != nil {
+		txmetrics.Duration.WithLabelValues("Failed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
+	}
+	return nil
 }
 
 func (r *TransactionReconciler) failAndReleaseLocks(ctx context.Context, txn *backupv1alpha1.Transaction, message string) error {
 	log := logf.FromContext(ctx)
 	leaseRefs := r.collectLeaseRefs(txn)
 	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
-		txmetrics.LockOperations.WithLabelValues("release", "error").Add(float64(len(leaseRefs)))
+		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
 		log.Error(err, "best-effort lease release failed during failure handling")
 	} else {
-		txmetrics.LockOperations.WithLabelValues("release", "success").Add(float64(len(leaseRefs)))
+		txmetrics.LockOperations.WithLabelValues("release", "success").Inc()
 	}
 	return r.setFailed(ctx, txn, message)
 }
@@ -745,7 +751,7 @@ func recordPhaseChange(from, to backupv1alpha1.TransactionPhase) {
 		oldPhase = "Pending"
 	}
 	txmetrics.PhaseTransitions.WithLabelValues(oldPhase, string(to)).Inc()
-	if !isTerminalPhase(from) && from != "" {
+	if !isTerminalPhase(from) && from != "" && from != backupv1alpha1.TransactionPhasePending {
 		txmetrics.ActiveTransactions.WithLabelValues(oldPhase).Dec()
 	}
 	if !isTerminalPhase(to) {
