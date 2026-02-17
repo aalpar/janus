@@ -6,14 +6,7 @@ Lease-based advisory locking.
 
 ## Goals
 
-Janus extends Kubernetes with optional atomic multi-resource semantics.
-Kubernetes [deliberately does not provide
-transactions](https://github.com/kubernetes/design-proposals-archive/blob/main/architecture/architecture.md)
-— by design, `kubectl apply` operates on resources independently. If the third
-of five manifests fails, the first two are already committed with no automatic
-rollback.
-
-Janus provides:
+Janus provides atomic multi-resource mutations for Kubernetes:
 
 - **Atomic multi-resource mutations.** A `Transaction` groups an ordered list
   of create, update, patch, and delete operations. Either all succeed or all
@@ -48,28 +41,28 @@ Janus provides:
 
 ### Kubernetes' design philosophy
 
-[Kubernetes deliberately does not support atomic transactions across multiple
-resources](https://github.com/kubernetes/design-proposals-archive/blob/main/architecture/architecture.md).
-This is an intentional design decision, not a limitation to be fixed. The
-[architecture principles](https://github.com/kubernetes/design-proposals-archive/blob/main/architecture/principles.md)
-explicitly state that atomic enforcement of invariants is "contention-prone and
-doesn't provide a recovery path in the case of a bug allowing the invariant to
-be violated."
+> [!NOTE]
+> [Kubernetes deliberately does not support atomic transactions across multiple
+> resources](https://github.com/kubernetes/design-proposals-archive/blob/main/architecture/architecture.md).
+> This is an intentional design decision, not a limitation to be fixed. The
+> [architecture principles](https://github.com/kubernetes/design-proposals-archive/blob/main/architecture/principles.md)
+> explicitly state that atomic enforcement of invariants is "contention-prone
+> and doesn't provide a recovery path in the case of a bug allowing the
+> invariant to be violated."
+>
+> Instead, Kubernetes favors:
+> - **Eventual consistency** through level-based controllers that continuously
+>   reconcile actual state toward desired state
+> - **Decoupled components** coordinating via a shared API rather than
+>   distributed transactions
+> - **Independent resource operations** where each API write commits
+>   independently to etcd
+>
+> This design maximizes system resilience, extensibility, and horizontal
+> scalability. It works well for the vast majority of Kubernetes use cases.
 
-Instead, Kubernetes favors:
-
-- **Eventual consistency** through level-based controllers that continuously
-  reconcile actual state toward desired state
-- **Decoupled components** coordinating via a shared API rather than
-  distributed transactions
-- **Independent resource operations** where each API write commits
-  independently to etcd
-
-This design maximizes system resilience, extensibility, and horizontal
-scalability. It works well for the vast majority of Kubernetes use cases.
-
-**Janus extends Kubernetes where transactional semantics are needed.** It does
-not replace or contradict Kubernetes' design — it adds an optional layer for
+Janus extends Kubernetes where transactional semantics are needed. It does not
+replace or contradict Kubernetes' design — it adds an optional layer for
 scenarios where atomic multi-resource changes are a business requirement. If
 your use case tolerates eventual consistency (and most do), standard Kubernetes
 primitives are the right tool.
@@ -91,7 +84,7 @@ Existing approaches handle this incompletely:
 | Argo Rollouts | Scoped to Deployment roll-forward, not arbitrary resources |
 | Manual scripts | No crash resilience, no structured compensation |
 
-### Why Sagas
+### Why the Saga pattern
 
 The [Saga pattern](https://dl.acm.org/doi/10.1145/38714.38742) (Garcia-Molina
 & Salem, 1987) decomposes a long-lived transaction into a sequence of
