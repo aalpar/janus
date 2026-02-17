@@ -225,7 +225,9 @@ func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1
 	txn.Status.StartedAt = &now
 	txn.Status.Items = make([]backupv1alpha1.ItemStatus, len(txn.Spec.Changes))
 	txn.Status.RollbackRef = txn.Name + rollbackCMSuffix
-	txmetrics.ItemCount.Observe(float64(len(txn.Spec.Changes)))
+	if txn.Status.StartedAt == nil {
+		txmetrics.ItemCount.Observe(float64(len(txn.Spec.Changes)))
+	}
 
 	// Create the rollback ConfigMap.
 	cm := &corev1.ConfigMap{
@@ -360,7 +362,9 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
-	txmetrics.Duration.WithLabelValues("Committed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
+	if txn.Status.StartedAt != nil {
+		txmetrics.Duration.WithLabelValues("Committed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
+	}
 	return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseCommitted)
 }
 
@@ -418,7 +422,9 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
-	txmetrics.Duration.WithLabelValues("RolledBack").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
+	if txn.Status.StartedAt != nil {
+		txmetrics.Duration.WithLabelValues("RolledBack").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
+	}
 	return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRolledBack)
 }
 
@@ -639,17 +645,7 @@ func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alp
 	}
 	r.event(txn, eventType, "PhaseTransition", "transitioning to %s", phase)
 
-	oldPhase := string(txn.Status.Phase)
-	if oldPhase == "" {
-		oldPhase = "Pending"
-	}
-	txmetrics.PhaseTransitions.WithLabelValues(oldPhase, string(phase)).Inc()
-	if !isTerminalPhase(txn.Status.Phase) && txn.Status.Phase != "" {
-		txmetrics.ActiveTransactions.WithLabelValues(oldPhase).Dec()
-	}
-	if !isTerminalPhase(phase) {
-		txmetrics.ActiveTransactions.WithLabelValues(string(phase)).Inc()
-	}
+	recordPhaseChange(txn.Status.Phase, phase)
 
 	txn.Status.Phase = phase
 	txn.Status.Version++
@@ -671,14 +667,7 @@ func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alph
 	log := logf.FromContext(ctx)
 	log.Error(fmt.Errorf("transaction failed"), message)
 
-	oldPhase := string(txn.Status.Phase)
-	if oldPhase == "" {
-		oldPhase = "Pending"
-	}
-	txmetrics.PhaseTransitions.WithLabelValues(oldPhase, "Failed").Inc()
-	if !isTerminalPhase(txn.Status.Phase) && txn.Status.Phase != "" {
-		txmetrics.ActiveTransactions.WithLabelValues(oldPhase).Dec()
-	}
+	recordPhaseChange(txn.Status.Phase, backupv1alpha1.TransactionPhaseFailed)
 	if txn.Status.StartedAt != nil {
 		txmetrics.Duration.WithLabelValues("Failed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
 	}
@@ -746,6 +735,21 @@ func cleanForRestore(obj *unstructured.Unstructured, targetNS string) {
 	delete(obj.Object, "status")
 	if targetNS != "" {
 		obj.SetNamespace(targetNS)
+	}
+}
+
+// recordPhaseChange updates phase-transition counter and active-transactions gauge.
+func recordPhaseChange(from, to backupv1alpha1.TransactionPhase) {
+	oldPhase := string(from)
+	if oldPhase == "" {
+		oldPhase = "Pending"
+	}
+	txmetrics.PhaseTransitions.WithLabelValues(oldPhase, string(to)).Inc()
+	if !isTerminalPhase(from) && from != "" {
+		txmetrics.ActiveTransactions.WithLabelValues(oldPhase).Dec()
+	}
+	if !isTerminalPhase(to) {
+		txmetrics.ActiveTransactions.WithLabelValues(string(to)).Inc()
 	}
 }
 

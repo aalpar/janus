@@ -107,6 +107,7 @@ var _ = Describe("Transaction Controller", func() {
 		txmetrics.ActiveTransactions.Reset()
 		txmetrics.ItemOperations.Reset()
 		txmetrics.LockOperations.Reset()
+		// ItemCount is prometheus.Histogram (interface) — no Reset(). Not asserted in tests.
 	})
 
 	AfterEach(func() {
@@ -224,6 +225,8 @@ var _ = Describe("Transaction Controller", func() {
 
 			// Verify metrics.
 			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Pending", "Preparing"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Preparing", "Prepared"))).To(Equal(1.0))
+			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Prepared", "Committing"))).To(Equal(1.0))
 			Expect(testutil.ToFloat64(txmetrics.PhaseTransitions.WithLabelValues("Committing", "Committed"))).To(Equal(1.0))
 			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("prepare", "success"))).To(Equal(1.0))
 			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("commit", "success"))).To(Equal(1.0))
