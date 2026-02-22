@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -338,7 +339,15 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 			return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
 		}
 
-		if err := r.applyChange(ctx, userClient, change, ns, txn.Name); err != nil {
+		if err := r.applyChange(ctx, userClient, change, ns, txn.Name, txn.Status.Items[i].ResourceVersion); err != nil {
+			var conflictErr *ErrConflictDetected
+			if errors.As(err, &conflictErr) {
+				txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
+				log.Error(err, "conflict detected during apply, failing transaction", "item", i)
+				r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
+					"item %d: %s/%s was modified externally", i, change.Target.Kind, change.Target.Name)
+				return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+			}
 			txmetrics.ItemOperations.WithLabelValues("commit", "error").Inc()
 			txn.Status.Items[i].Error = err.Error()
 			log.Error(err, "commit failed, initiating rollback", "item", i)
@@ -488,7 +497,10 @@ func (r *TransactionReconciler) getResource(ctx context.Context, cl client.Clien
 
 // applyChange dispatches the appropriate mutation for a ResourceChange.
 // txnName is used as the field manager identity for server-side apply patches.
-func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace, txnName string) error {
+// storedRV is the resourceVersion captured during prepare; it enables native
+// Kubernetes conflict detection for Update (optimistic concurrency) and Delete
+// (precondition) operations.
+func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace, txnName, storedRV string) error {
 	switch change.Type {
 	case backupv1alpha1.ChangeTypeCreate:
 		obj, err := r.unmarshalContent(change.Content, change.Target)
@@ -510,13 +522,14 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Clien
 			return err
 		}
 		obj.SetNamespace(namespace)
-		// Fetch current resourceVersion for the update.
-		existing, err := r.getResource(ctx, cl, change.Target, namespace)
-		if err != nil {
-			return &ResourceOpError{Op: "fetching for update", Err: err}
+		obj.SetResourceVersion(storedRV)
+		if err := cl.Update(ctx, obj); err != nil {
+			if apierrors.IsConflict(err) {
+				return &ErrConflictDetected{Ref: change.Target, Expected: storedRV}
+			}
+			return err
 		}
-		obj.SetResourceVersion(existing.GetResourceVersion())
-		return cl.Update(ctx, obj)
+		return nil
 
 	case backupv1alpha1.ChangeTypePatch:
 		// Server-side apply: Janus owns only the fields specified in the patch.
@@ -545,7 +558,19 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Clien
 			}
 			return &ResourceOpError{Op: "fetching for delete", Err: err}
 		}
-		return cl.Delete(ctx, existing)
+		deleteOpts := &client.DeleteOptions{}
+		if storedRV != "" {
+			deleteOpts.Preconditions = &metav1.Preconditions{
+				ResourceVersion: &storedRV,
+			}
+		}
+		if err := cl.Delete(ctx, existing, deleteOpts); err != nil {
+			if apierrors.IsConflict(err) {
+				return &ErrConflictDetected{Ref: change.Target, Expected: storedRV}
+			}
+			return err
+		}
+		return nil
 
 	default:
 		return fmt.Errorf("%w: %s", errUnknownChangeType, change.Type)
