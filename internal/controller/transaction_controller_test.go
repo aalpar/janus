@@ -2087,6 +2087,243 @@ var _ = Describe("Transaction Controller", func() {
 			// TxnB's "txn-b-modified" is gone — split-brain!
 		})
 	})
+
+	Context("conflict detection", func() {
+		It("should store resourceVersion in ItemStatus during prepare", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-rv-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "value"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-rv-cm", Namespace: testNamespace,
+			}, cm)).To(Succeed())
+			expectedRV := cm.ResourceVersion
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rv-capture-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "conflict-rv-cm",
+							Namespace:  testNamespace,
+						},
+						Type:    backupv1alpha1.ChangeTypePatch,
+						Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"patched"}}`)},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			reconcileToPhase(reconciler, "rv-capture-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "rv-capture-txn", Namespace: testNamespace,
+			}, txn)).To(Succeed())
+			Expect(txn.Status.Items[0].ResourceVersion).To(Equal(expectedRV))
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("should fail the transaction when resource is modified between prepare and commit (Patch)", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-patch-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-patch-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "conflict-patch-cm",
+							Namespace:  testNamespace,
+						},
+						Type:    backupv1alpha1.ChangeTypePatch,
+						Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"patched"}}`)},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			reconcileToPhase(reconciler, "conflict-patch-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// External actor modifies the resource.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-patch-cm", Namespace: testNamespace,
+			}, cm)).To(Succeed())
+			cm.Data["key"] = "externally-modified"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+			// Reconcile through Committing — should detect conflict and fail.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name: "conflict-patch-txn", Namespace: testNamespace,
+				}, txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted {
+					break
+				}
+				_, _ = reconciler.Reconcile(ctx, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Name: "conflict-patch-txn", Namespace: testNamespace,
+					},
+				})
+			}
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-patch-txn", Namespace: testNamespace,
+			}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			// Verify the failure message mentions conflict.
+			var failedCondition *metav1.Condition
+			for i := range txn.Status.Conditions {
+				if txn.Status.Conditions[i].Type == "Failed" {
+					failedCondition = &txn.Status.Conditions[i]
+					break
+				}
+			}
+			Expect(failedCondition).NotTo(BeNil())
+			Expect(failedCondition.Message).To(ContainSubstring("conflict"))
+			Expect(failedCondition.Message).To(ContainSubstring("resourceVersion"))
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("should fail the transaction when resource is modified between prepare and commit (Delete)", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-delete-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "value"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-delete-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "conflict-delete-cm",
+							Namespace:  testNamespace,
+						},
+						Type: backupv1alpha1.ChangeTypeDelete,
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			reconcileToPhase(reconciler, "conflict-delete-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// External actor modifies the resource.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-delete-cm", Namespace: testNamespace,
+			}, cm)).To(Succeed())
+			cm.Data["key"] = "externally-modified"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+			// Reconcile — should detect conflict and fail.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name: "conflict-delete-txn", Namespace: testNamespace,
+				}, txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted {
+					break
+				}
+				_, _ = reconciler.Reconcile(ctx, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Name: "conflict-delete-txn", Namespace: testNamespace,
+					},
+				})
+			}
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-delete-txn", Namespace: testNamespace,
+			}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("should not check for conflicts on Create (no prior resource)", func() {
+			cmContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "conflict-create-cm",
+					"namespace": testNamespace,
+				},
+				"data": map[string]any{"key": "value"},
+			}
+			raw, err := json.Marshal(cmContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-create-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "conflict-create-cm",
+							Namespace:  testNamespace,
+						},
+						Type:    backupv1alpha1.ChangeTypeCreate,
+						Content: runtime.RawExtension{Raw: raw},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			reconcileToPhase(reconciler, "conflict-create-txn", backupv1alpha1.TransactionPhaseCommitted)
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-create-txn", Namespace: testNamespace,
+			}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
+			Expect(txn.Status.Items[0].ResourceVersion).To(BeEmpty())
+
+			// Clean up.
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-create-cm", Namespace: testNamespace,
+			}, cm)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
 })
 
 // reconcileToPhase drives the reconciler until the transaction reaches the target phase.
