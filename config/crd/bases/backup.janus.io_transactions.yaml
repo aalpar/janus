@@ -110,6 +110,13 @@ spec:
                   Must exist in the Transaction's namespace.
                 minLength: 1
                 type: string
+              timeout:
+                description: |-
+                  Timeout bounds the overall transaction duration.
+                  When elapsed, the transaction transitions to RollingBack (if any commits
+                  exist) or Failed (if none do).
+                  Defaults to 30 minutes.
+                type: string
             required:
             - changes
             - serviceAccountName

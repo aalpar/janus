@@ -84,6 +84,12 @@ type TransactionSpec struct {
 	// Defaults to 5 minutes.
 	// +optional
 	LockTimeout *metav1.Duration `json:"lockTimeout,omitempty"`
+	// Timeout bounds the overall transaction duration.
+	// When elapsed, the transaction transitions to RollingBack (if any commits
+	// exist) or Failed (if none do).
+	// Defaults to 30 minutes.
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
 }
 
 // ItemStatus tracks the state of a single resource change within the transaction.

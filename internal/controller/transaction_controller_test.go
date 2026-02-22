@@ -2371,6 +2371,244 @@ var _ = Describe("Transaction Controller", func() {
 			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
 		})
 	})
+
+	Context("transaction timeout", func() {
+		It("should fail a timed-out transaction with no commits", func() {
+			txn := minimalTxn("timeout-no-commits")
+			txn.Spec.Timeout = &metav1.Duration{Duration: 1 * time.Nanosecond}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "timeout-no-commits", Namespace: testNamespace}}
+
+			// Reconcile 1: adds finalizer.
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile 2: Pending -> sets StartedAt, transitions to Preparing.
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// At this point StartedAt is set and 1ns timeout has already expired.
+			// Next reconcile should detect timeout. No items are committed.
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, req.NamespacedName, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			failedCond := apimeta.FindStatusCondition(txn.Status.Conditions, "Failed")
+			Expect(failedCond).NotTo(BeNil())
+			Expect(failedCond.Message).To(ContainSubstring("timed out"))
+
+			// Clean up created ConfigMap (rollback CM).
+			cm := &corev1.ConfigMap{}
+			_ = k8sClient.Get(ctx, types.NamespacedName{Name: "timeout-no-commits-cm", Namespace: testNamespace}, cm)
+			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
+		})
+
+		It("should roll back a timed-out transaction with committed items", func() {
+			// Create a target ConfigMap that will be updated.
+			targetCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "timeout-target-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"original": "data"},
+			}
+			Expect(k8sClient.Create(ctx, targetCM)).To(Succeed())
+
+			updateContent, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "timeout-target-cm", "namespace": testNamespace},
+				"data":       map[string]any{"updated": "first"},
+			})
+			createContent, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "timeout-new-cm", "namespace": testNamespace},
+				"data":       map[string]any{"new": "item"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "timeout-with-commits",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Timeout:            &metav1.Duration{Duration: 10 * time.Minute},
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "timeout-target-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeUpdate,
+							Content: runtime.RawExtension{Raw: updateContent},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "timeout-new-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: createContent},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "timeout-with-commits", Namespace: testNamespace}}
+
+			// Drive through: finalizer, Pending->Preparing, prepare item 0, prepare item 1,
+			// Prepared->Committing, commit item 0 (Update).
+			// That's ~6 reconcile cycles. Use reconcileToPhase to get to Committing,
+			// then one more to commit item 0.
+			reconcileToPhase(reconciler, "timeout-with-commits", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Reconcile once more to commit item 0.
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify item 0 is committed but item 1 is not.
+			Expect(k8sClient.Get(ctx, req.NamespacedName, txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+			Expect(txn.Status.Items[1].Committed).To(BeFalse())
+
+			// Backdate startedAt to 20 minutes ago to trigger timeout.
+			past := metav1.NewTime(time.Now().Add(-20 * time.Minute))
+			txn.Status.StartedAt = &past
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Next reconcile should detect timeout and transition to RollingBack.
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, req.NamespacedName, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Clean up created ConfigMaps.
+			for _, name := range []string{"timeout-target-cm", "timeout-new-cm"} {
+				cm := &corev1.ConfigMap{}
+				_ = k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, cm)
+				_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
+			}
+		})
+
+		It("should fail a timed-out rollback", func() {
+			// Create a target ConfigMap that will be updated.
+			targetCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-timeout-target-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"original": "data"},
+			}
+			Expect(k8sClient.Create(ctx, targetCM)).To(Succeed())
+
+			updateContent, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "rb-timeout-target-cm", "namespace": testNamespace},
+				"data":       map[string]any{"updated": "first"},
+			})
+			createContent, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "rb-timeout-new-cm", "namespace": testNamespace},
+				"data":       map[string]any{"new": "item"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "timeout-rollback",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Timeout:            &metav1.Duration{Duration: 10 * time.Minute},
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-timeout-target-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeUpdate,
+							Content: runtime.RawExtension{Raw: updateContent},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-timeout-new-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: createContent},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "timeout-rollback", Namespace: testNamespace}}
+
+			// Drive through to Committing, then commit item 0.
+			reconcileToPhase(reconciler, "timeout-rollback", backupv1alpha1.TransactionPhaseCommitting)
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify item 0 is committed.
+			Expect(k8sClient.Get(ctx, req.NamespacedName, txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+			Expect(txn.Status.Items[1].Committed).To(BeFalse())
+
+			// Backdate startedAt to trigger timeout -> RollingBack.
+			past := metav1.NewTime(time.Now().Add(-20 * time.Minute))
+			txn.Status.StartedAt = &past
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, req.NamespacedName, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Now we're in RollingBack with a backdated startedAt.
+			// The timeout should fire again and transition to Failed.
+			// Re-backdate in case the status update reset it.
+			Expect(k8sClient.Get(ctx, req.NamespacedName, txn)).To(Succeed())
+			past = metav1.NewTime(time.Now().Add(-20 * time.Minute))
+			txn.Status.StartedAt = &past
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, req.NamespacedName, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			failedCond := apimeta.FindStatusCondition(txn.Status.Conditions, "Failed")
+			Expect(failedCond).NotTo(BeNil())
+			Expect(failedCond.Message).To(ContainSubstring("timed out"))
+
+			// Clean up created ConfigMaps.
+			for _, name := range []string{"rb-timeout-target-cm", "rb-timeout-new-cm"} {
+				cm := &corev1.ConfigMap{}
+				_ = k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, cm)
+				_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
+			}
+		})
+	})
 })
 
 // reconcileToPhase drives the reconciler until the transaction reaches the target phase.

@@ -45,9 +45,10 @@ import (
 )
 
 const (
-	defaultTimeout   = 5 * time.Minute
-	rollbackCMSuffix = "-rollback"
-	finalizerName    = "backup.janus.io/lease-cleanup"
+	defaultTimeout            = 5 * time.Minute
+	defaultTransactionTimeout = 30 * time.Minute
+	rollbackCMSuffix          = "-rollback"
+	finalizerName             = "backup.janus.io/lease-cleanup"
 )
 
 // cachedClient holds a lazily-initialized impersonating client.
@@ -133,6 +134,27 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+	}
+
+	// Check transaction-level timeout for non-terminal, in-progress phases.
+	if txn.Status.StartedAt != nil && !isTerminalPhase(txn.Status.Phase) {
+		deadline := txn.Status.StartedAt.Time.Add(r.transactionTimeout(&txn))
+		if time.Now().After(deadline) {
+			elapsed := time.Since(txn.Status.StartedAt.Time).Round(time.Second)
+			if txn.Status.Phase == backupv1alpha1.TransactionPhaseRollingBack {
+				log.Info("rollback timed out", "elapsed", elapsed)
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, &txn, fmt.Sprintf("rollback timed out after %s", elapsed))
+			}
+			if r.hasUnrolledCommits(&txn) {
+				log.Info("transaction timed out with committed items, initiating rollback", "elapsed", elapsed)
+				r.event(&txn, corev1.EventTypeWarning, "Timeout", "transaction timed out after %s, rolling back", elapsed)
+				now := metav1.Now()
+				txn.Status.StartedAt = &now // Reset so rollback gets a fresh timeout window.
+				return r.transition(ctx, &txn, backupv1alpha1.TransactionPhaseRollingBack)
+			}
+			log.Info("transaction timed out with no commits", "elapsed", elapsed)
+			return ctrl.Result{}, r.failAndReleaseLocks(ctx, &txn, fmt.Sprintf("transaction timed out after %s", elapsed))
+		}
 	}
 
 	// Phases that don't need an impersonating client.
@@ -688,6 +710,13 @@ func (r *TransactionReconciler) lockTimeout(txn *backupv1alpha1.Transaction) tim
 		return txn.Spec.LockTimeout.Duration
 	}
 	return defaultTimeout
+}
+
+func (r *TransactionReconciler) transactionTimeout(txn *backupv1alpha1.Transaction) time.Duration {
+	if txn.Spec.Timeout != nil {
+		return txn.Spec.Timeout.Duration
+	}
+	return defaultTransactionTimeout
 }
 
 func (r *TransactionReconciler) collectLeaseRefs(txn *backupv1alpha1.Transaction) []lock.LeaseRef {
