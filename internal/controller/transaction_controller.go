@@ -328,6 +328,16 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 		txmetrics.LockOperations.WithLabelValues("renew", "success").Inc()
 
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
+
+		// Check for external modifications since prepare.
+		if err := r.checkConflict(ctx, userClient, change, ns, txn.Status.Items[i].ResourceVersion); err != nil {
+			txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
+			log.Error(err, "conflict detected, failing transaction", "item", i)
+			r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
+				"item %d: %s/%s was modified externally since prepare", i, change.Target.Kind, change.Target.Name)
+			return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+		}
+
 		if err := r.applyChange(ctx, userClient, change, ns, txn.Name); err != nil {
 			txmetrics.ItemOperations.WithLabelValues("commit", "error").Inc()
 			txn.Status.Items[i].Error = err.Error()
@@ -428,6 +438,31 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		txmetrics.Duration.WithLabelValues("RolledBack").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
 	}
 	return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRolledBack)
+}
+
+// checkConflict verifies that a target resource has not been modified since prepare.
+func (r *TransactionReconciler) checkConflict(ctx context.Context, cl client.Client,
+	change backupv1alpha1.ResourceChange, ns string, expectedRV string) error {
+
+	if change.Type == backupv1alpha1.ChangeTypeCreate || expectedRV == "" {
+		return nil
+	}
+
+	obj, err := r.getResource(ctx, cl, change.Target, ns)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return &ErrConflictDetected{Ref: change.Target, Expected: expectedRV}
+		}
+		return err
+	}
+	if obj.GetResourceVersion() != expectedRV {
+		return &ErrConflictDetected{
+			Ref:      change.Target,
+			Expected: expectedRV,
+			Actual:   obj.GetResourceVersion(),
+		}
+	}
+	return nil
 }
 
 // --- Resource operations ---
