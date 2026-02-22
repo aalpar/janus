@@ -709,6 +709,9 @@ func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alp
 
 	oldPhase := txn.Status.Phase
 	txn.Status.Phase = phase
+	if c := conditionForPhase(phase); c != nil {
+		apimeta.SetStatusCondition(&txn.Status.Conditions, *c)
+	}
 	txn.Status.Version++
 	if err := r.Status().Update(ctx, txn); err != nil {
 		return ctrl.Result{}, err
@@ -716,6 +719,40 @@ func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alp
 
 	recordPhaseChange(oldPhase, phase)
 	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+}
+
+// conditionForPhase returns a status Condition for significant phase milestones, nil otherwise.
+// Failed is intentionally excluded — setFailed() handles it with a custom message.
+func conditionForPhase(phase backupv1alpha1.TransactionPhase) *metav1.Condition {
+	now := metav1.Now()
+	switch phase {
+	case backupv1alpha1.TransactionPhasePrepared:
+		return &metav1.Condition{
+			Type:               "Prepared",
+			Status:             metav1.ConditionTrue,
+			Reason:             "AllItemsPrepared",
+			Message:            "All items have been prepared",
+			LastTransitionTime: now,
+		}
+	case backupv1alpha1.TransactionPhaseCommitted:
+		return &metav1.Condition{
+			Type:               "Committed",
+			Status:             metav1.ConditionTrue,
+			Reason:             "AllItemsCommitted",
+			Message:            "All items have been committed",
+			LastTransitionTime: now,
+		}
+	case backupv1alpha1.TransactionPhaseRolledBack:
+		return &metav1.Condition{
+			Type:               "RolledBack",
+			Status:             metav1.ConditionTrue,
+			Reason:             "RollbackComplete",
+			Message:            "All committed items have been rolled back",
+			LastTransitionTime: now,
+		}
+	default:
+		return nil
+	}
 }
 
 func (r *TransactionReconciler) updateStatusAndRequeue(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {

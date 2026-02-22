@@ -27,6 +27,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -2322,6 +2323,52 @@ var _ = Describe("Transaction Controller", func() {
 				Name: "conflict-create-cm", Namespace: testNamespace,
 			}, cm)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("status conditions", func() {
+		It("should set Prepared condition when all items are prepared", func() {
+			txn := minimalTxn("cond-prepared")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Drive through: finalizer, Pending→Preparing, prepare item, Preparing→Prepared→Committing
+			reconcileToPhase(reconciler, "cond-prepared", backupv1alpha1.TransactionPhaseCommitting)
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cond-prepared", Namespace: testNamespace}, txn)).To(Succeed())
+
+			prepared := apimeta.FindStatusCondition(txn.Status.Conditions, "Prepared")
+			Expect(prepared).NotTo(BeNil())
+			Expect(prepared.Status).To(Equal(metav1.ConditionTrue))
+			Expect(prepared.Reason).To(Equal("AllItemsPrepared"))
+
+			// Clean up created ConfigMap.
+			cm := &corev1.ConfigMap{}
+			_ = k8sClient.Get(ctx, types.NamespacedName{Name: "cond-prepared-cm", Namespace: testNamespace}, cm)
+			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
+		})
+
+		It("should set Committed condition when transaction completes", func() {
+			txn := minimalTxn("cond-committed")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			reconcileToPhase(reconciler, "cond-committed", backupv1alpha1.TransactionPhaseCommitted)
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cond-committed", Namespace: testNamespace}, txn)).To(Succeed())
+
+			committed := apimeta.FindStatusCondition(txn.Status.Conditions, "Committed")
+			Expect(committed).NotTo(BeNil())
+			Expect(committed.Status).To(Equal(metav1.ConditionTrue))
+			Expect(committed.Reason).To(Equal("AllItemsCommitted"))
+
+			// Prepared condition should still be present (monotonic).
+			prepared := apimeta.FindStatusCondition(txn.Status.Conditions, "Prepared")
+			Expect(prepared).NotTo(BeNil())
+			Expect(prepared.Status).To(Equal(metav1.ConditionTrue))
+
+			// Clean up created ConfigMap.
+			cm := &corev1.ConfigMap{}
+			_ = k8sClient.Get(ctx, types.NamespacedName{Name: "cond-committed-cm", Namespace: testNamespace}, cm)
+			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
 		})
 	})
 })

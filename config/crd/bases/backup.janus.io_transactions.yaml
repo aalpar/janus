@@ -205,6 +205,11 @@ spec:
                       description: Prepared indicates whether the resource's prior
                         state has been captured.
                       type: boolean
+                    resourceVersion:
+                      description: |-
+                        ResourceVersion is the target resource's version at prepare time.
+                        Used to detect external modifications before commit.
+                      type: string
                     rolledBack:
                       description: RolledBack indicates whether a committed change
                         has been reverted.
