@@ -19,6 +19,8 @@ package controller
 import (
 	"errors"
 	"fmt"
+
+	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
 )
 
 // Sentinel errors for controller operations.
@@ -59,4 +61,20 @@ func (e *RollbackDataError) Error() string {
 
 func (e *RollbackDataError) Unwrap() error {
 	return e.Err
+}
+
+// ErrConflictDetected indicates a target resource was modified between prepare and commit.
+type ErrConflictDetected struct {
+	Ref      backupv1alpha1.ResourceRef
+	Expected string // resourceVersion at prepare time
+	Actual   string // resourceVersion at commit time (empty if resource was deleted)
+}
+
+func (e *ErrConflictDetected) Error() string {
+	if e.Actual == "" {
+		return fmt.Sprintf("conflict on %s/%s: resource was deleted (expected resourceVersion %s)",
+			e.Ref.Kind, e.Ref.Name, e.Expected)
+	}
+	return fmt.Sprintf("conflict on %s/%s: resourceVersion changed from %s to %s",
+		e.Ref.Kind, e.Ref.Name, e.Expected, e.Actual)
 }
