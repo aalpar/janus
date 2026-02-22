@@ -94,6 +94,10 @@ type ItemStatus struct {
 	// LeaseNamespace is the namespace of the Lease object.
 	// +optional
 	LeaseNamespace string `json:"leaseNamespace,omitempty"`
+	// ResourceVersion is the target resource's version at prepare time.
+	// Used to detect external modifications before commit.
+	// +optional
+	ResourceVersion string `json:"resourceVersion,omitempty"`
 	// Prepared indicates whether the resource's prior state has been captured.
 	Prepared bool `json:"prepared"`
 	// Committed indicates whether the mutation has been applied.
