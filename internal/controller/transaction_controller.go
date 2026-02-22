@@ -288,6 +288,7 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
 				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: reading current state: %v", i, err))
 			}
+			txn.Status.Items[i].ResourceVersion = obj.GetResourceVersion()
 			if err := r.saveRollbackState(ctx, txn, change, obj); err != nil {
 				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
 				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: saving rollback state: %v", i, err))
