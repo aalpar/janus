@@ -153,9 +153,13 @@ func LoadImageToKindClusterWithName(name string) error {
 // LoadImageToK0s imports a local docker image into the k0s containerd store.
 // Requires sudo access to the k0s containerd socket.
 func LoadImageToK0s(name string) error {
+	reader, err := dockerSave(name)
+	if err != nil {
+		return err
+	}
 	cmd := exec.Command("sudo", "k0s", "ctr", "images", "import", "-")
-	cmd.Stdin, _ = dockerSave(name)
-	_, err := Run(cmd)
+	cmd.Stdin = reader
+	_, err = Run(cmd)
 	return err
 }
 

@@ -61,10 +61,8 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
+# E2E tests default to Kind. Set E2E_CLUSTER_PROVIDER=k0s for k0s clusters.
+# CertManager is installed by default; skip with CERT_MANAGER_INSTALL_SKIP=true.
 KIND_CLUSTER ?= janus-test-e2e
 
 .PHONY: setup-test-e2e
@@ -89,6 +87,10 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+
+.PHONY: test-e2e-k0s
+test-e2e-k0s: manifests generate fmt vet ## Run e2e tests against an existing k0s cluster.
+	E2E_CLUSTER_PROVIDER=k0s go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
