@@ -54,6 +54,16 @@ func init() {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "recover":
+			os.Exit(runRecover(os.Args[2:]))
+		}
+	}
+	os.Exit(runController())
+}
+
+func runController() int {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var enableLeaderElection bool
@@ -116,7 +126,7 @@ func main() {
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
+		return 1
 	}
 
 	if err := (&controller.TransactionReconciler{
@@ -129,26 +139,27 @@ func main() {
 		Recorder: mgr.GetEventRecorderFor("transaction-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Transaction")
-		os.Exit(1)
+		return 1
 	}
 	if err := backupv1alpha1.SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "Transaction")
-		os.Exit(1)
+		return 1
 	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
+		return 1
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
+		return 1
 	}
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
