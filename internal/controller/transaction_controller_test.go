@@ -1718,24 +1718,14 @@ var _ = Describe("Transaction Controller", func() {
 		})
 	})
 
-	Context("lease expiry and split-brain recovery", func() {
-		It("documents split-brain risk: auto-recovery uses stale rollback state", func() {
-			// VULNERABILITY DOCUMENTATION:
-			// When TxnA fails and its leases expire, TxnB can acquire them.
-			// TxnA's auto-recovery rollback uses ConfigMapA's stale prior-state snapshots,
-			// not the current state that TxnB may have modified. This can corrupt data.
+	Context("lease expiry and split-brain prevention", func() {
+		It("should detect external modification and fail instead of clobbering", func() {
+			// Previously this was a documented vulnerability: when TxnA fails and
+			// its leases expire, TxnB can acquire them and modify the resource.
+			// TxnA's auto-recovery rollback would blindly overwrite TxnB's changes.
 			//
-			// Example:
-			// 1. TxnA commits: Service replicas 3→5 (saves prior=3)
-			// 2. TxnA commits: Service replicas 5→7 (saves prior=5)
-			// 3. TxnA fails on item 3, leases expire
-			// 4. TxnB takes leases, modifies Service to 8 replicas
-			// 5. TxnA auto-recovers and rolls back using ConfigMapA
-			// 6. TxnA restores item 1 to prior=5 (ConfigMapA's stale value)
-			// 7. Result: Service at 5 replicas, TxnB's change to 8 is lost (split-brain)
-			//
-			// Current mitigation: operational discipline + one-item-per-cycle design
-			// makes window narrow. Better: require explicit rollback trigger.
+			// Now the rollback RV check detects the external modification and
+			// transitions to Failed, requiring manual intervention via janus recover.
 
 			// Create target resource.
 			origCM := &corev1.ConfigMap{
@@ -1748,7 +1738,6 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Create(ctx, origCM)).To(Succeed())
 
 			// Create transaction with 2 items.
-
 			txn := &backupv1alpha1.Transaction{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "staledata-txn",
@@ -1777,7 +1766,7 @@ var _ = Describe("Transaction Controller", func() {
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
 
-			// Drive to commit item 0 (saves original state in ConfigMapA).
+			// Drive to commit item 0 (saves original state in rollback CM).
 			reconcileToPhase(reconciler, "staledata-txn", backupv1alpha1.TransactionPhaseCommitting)
 			_, err := reconciler.Reconcile(ctx, req("staledata-txn"))
 			Expect(err).NotTo(HaveOccurred())
@@ -1802,19 +1791,27 @@ var _ = Describe("Transaction Controller", func() {
 			origCM.Data["key"] = "txn-b-modified"
 			Expect(k8sClient.Update(ctx, origCM)).To(Succeed())
 
-			// TxnA auto-recovers and rollbacks using stale ConfigMapA.
-			// The rollback will restore from prior-state (original), losing TxnB's change.
-			reconcileToPhase(reconciler, "staledata-txn", backupv1alpha1.TransactionPhaseRolledBack)
+			// TxnA auto-recovers and attempts rollback — detects RV mismatch → Failed.
+			// Recovery transitions Failed→RollingBack, then rollback detects conflict.
+			_, err = reconciler.Reconcile(ctx, req("staledata-txn"))
+			Expect(err).NotTo(HaveOccurred()) // Failed→RollingBack transition
 
-			// Verify rollback succeeded.
 			Expect(k8sClient.Get(ctx, nn("staledata-txn"), txn)).To(Succeed())
-			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
 
-			// This is the vulnerability: the resource was rolled back to prior-state (original),
-			// losing TxnB's modification.
+			_, err = reconciler.Reconcile(ctx, req("staledata-txn"))
+			Expect(err).NotTo(HaveOccurred()) // RollingBack→Failed (conflict detected)
+
+			Expect(k8sClient.Get(ctx, nn("staledata-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+			Expect(txn.Status.Items[0].Error).To(ContainSubstring("rollback conflict"))
+
+			// TxnB's modification is preserved — split-brain prevented.
 			Expect(k8sClient.Get(ctx, nn("staledata-cm"), origCM)).To(Succeed())
-			Expect(origCM.Data["key"]).To(Equal("original"))
-			// TxnB's "txn-b-modified" is gone — split-brain!
+			Expect(origCM.Data["key"]).To(Equal("txn-b-modified"))
+
+			// Rollback ConfigMap preserved for manual recovery via janus recover.
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: testNamespace}, rbCM)).To(Succeed())
 		})
 	})
 
@@ -2661,6 +2658,111 @@ var _ = Describe("Transaction Controller", func() {
 			created := &corev1.ConfigMap{}
 			_ = k8sClient.Get(ctx, nn("meta-txn-cm"), created)
 			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, created))
+		})
+	})
+
+	Context("rollback conflict detection", func() {
+		It("should fail the transaction when a resource was modified externally during rollback", func() {
+			// 1. Create target CM with original data.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rbconflict-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			// 2. Create a 2-item transaction: Patch cm (item 0) + blocker Create (item 1).
+			patchContent, err := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rbconflict-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rbconflict-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						blockerChange("rbconflict-blocker"),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Use real lock manager through prepare and commit.
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			// 3. Drive through Pending → Preparing → Prepared → Committing.
+			reconcileToPhase(reconciler, "rbconflict-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Reconcile to commit item 0 (Patch succeeds).
+			_, err = reconciler.Reconcile(ctx, req("rbconflict-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rbconflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+			Expect(txn.Status.Items[1].Committed).To(BeFalse())
+
+			// Swap to failing lock manager so item 1's lock renewal fails → RollingBack.
+			reconciler.LockMgr = failingRenewLockMgr()
+
+			_, err = reconciler.Reconcile(ctx, req("rbconflict-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rbconflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// 4. Externally modify the CM before rollback runs.
+			Expect(k8sClient.Get(ctx, nn("rbconflict-cm"), cm)).To(Succeed())
+			cm.Data["key"] = "externally-modified"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+			// 5. Reconcile rollback — should detect RV mismatch and transition to Failed.
+			_, err = reconciler.Reconcile(ctx, req("rbconflict-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// 6. Assert: phase=Failed, item[0].Error contains "rollback conflict".
+			Expect(k8sClient.Get(ctx, nn("rbconflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+			Expect(txn.Status.Items[0].Error).To(ContainSubstring("rollback conflict"))
+
+			// Verify the Failed condition is set.
+			failedCond := apimeta.FindStatusCondition(txn.Status.Conditions, "Failed")
+			Expect(failedCond).NotTo(BeNil())
+			Expect(failedCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(failedCond.Message).To(ContainSubstring("rollback conflict"))
+
+			// Verify the CM still has the external modification (not clobbered).
+			Expect(k8sClient.Get(ctx, nn("rbconflict-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("externally-modified"))
+
+			// 7. Assert: rollback ConfigMap still exists (preserved for janus recover).
+			rbCM := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{
+				Name:      txn.Status.RollbackRef,
+				Namespace: testNamespace,
+			}, rbCM)).To(Succeed())
+
+			// Verify conflict metric was recorded.
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("rollback", "conflict"))).To(BeNumerically(">=", 1.0))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
 	})
 })

@@ -78,3 +78,20 @@ func (e *ErrConflictDetected) Error() string {
 	return fmt.Sprintf("conflict on %s/%s: resourceVersion changed from %s to %s",
 		e.Ref.Kind, e.Ref.Name, e.Expected, e.Actual)
 }
+
+// ErrRollbackConflict indicates a resource was modified externally since
+// the rollback state was captured, making automatic rollback unsafe.
+type ErrRollbackConflict struct {
+	Ref       backupv1alpha1.ResourceRef
+	StoredRV  string // resourceVersion when rollback state was captured
+	CurrentRV string // current resourceVersion (empty if deleted)
+}
+
+func (e *ErrRollbackConflict) Error() string {
+	if e.CurrentRV == "" {
+		return fmt.Sprintf("rollback conflict on %s/%s: resource was deleted (stored RV %s)",
+			e.Ref.Kind, e.Ref.Name, e.StoredRV)
+	}
+	return fmt.Sprintf("rollback conflict on %s/%s: resource modified externally (stored RV %s, current RV %s)",
+		e.Ref.Kind, e.Ref.Name, e.StoredRV, e.CurrentRV)
+}

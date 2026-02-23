@@ -418,6 +418,16 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 
 		txmetrics.ItemOperations.WithLabelValues("commit", "success").Inc()
 		txn.Status.Items[i].Committed = true
+
+		// Update rollback envelope with post-commit RV so the rollback conflict
+		// check compares against the RV Janus wrote, not the pre-commit RV.
+		if change.Type == backupv1alpha1.ChangeTypeUpdate || change.Type == backupv1alpha1.ChangeTypePatch {
+			if err := r.updateRollbackRV(ctx, txn, change, ns, userClient); err != nil {
+				log.Error(err, "failed to update rollback RV after commit", "item", i)
+				// Non-fatal: worst case rollback will detect a false conflict.
+			}
+		}
+
 		log.Info("item committed", "item", i, "type", change.Type, "kind", change.Target.Kind, "name", change.Target.Name)
 		r.event(txn, corev1.EventTypeNormal, "ItemCommitted", "item %d: %s %s/%s committed", i, change.Type, change.Target.Kind, change.Target.Name)
 
@@ -467,6 +477,15 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 
 		if err := r.applyRollback(ctx, userClient, change, ns, rbCM); err != nil {
+			var conflictErr *ErrRollbackConflict
+			if errors.As(err, &conflictErr) {
+				txmetrics.ItemOperations.WithLabelValues("rollback", "conflict").Inc()
+				item.Error = err.Error()
+				log.Error(err, "rollback conflict detected, failing transaction", "item", i)
+				r.event(txn, corev1.EventTypeWarning, "RollbackConflict",
+					"item %d: %s — manual intervention required via janus recover", i, err)
+				return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+			}
 			txmetrics.ItemOperations.WithLabelValues("rollback", "error").Inc()
 			item.Error = fmt.Sprintf("rollback failed: %v", err)
 			log.Error(err, "rollback failed for item, will retry", "item", i)
@@ -474,7 +493,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 			if statusErr := r.Status().Update(ctx, txn); statusErr != nil {
 				log.Error(statusErr, "failed to persist rollback error on item status", "item", i)
 			}
-			return ctrl.Result{}, err // controller-runtime backoff
+			return ctrl.Result{}, err
 		}
 
 		txmetrics.ItemOperations.WithLabelValues("rollback", "success").Inc()
@@ -658,7 +677,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 	case backupv1alpha1.ChangeTypeUpdate, backupv1alpha1.ChangeTypePatch:
 		// Reverse = restore the previous state.
-		obj, _, err := loadRollbackState(rbCM, rbKey, namespace)
+		obj, storedRV, err := loadRollbackState(rbCM, rbKey, namespace)
 		if err != nil {
 			return err
 		}
@@ -677,12 +696,55 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 			}
 			return err
 		}
+		// Check for external modifications since prepare.
+		if storedRV != "" && existing.GetResourceVersion() != storedRV {
+			return &ErrRollbackConflict{
+				Ref:       change.Target,
+				StoredRV:  storedRV,
+				CurrentRV: existing.GetResourceVersion(),
+			}
+		}
 		obj.SetResourceVersion(existing.GetResourceVersion())
 		return cl.Update(ctx, obj)
 
 	default:
 		return fmt.Errorf("%w for rollback: %s", errUnknownChangeType, change.Type)
 	}
+}
+
+// updateRollbackRV reads the current resourceVersion of a committed resource
+// and updates the rollback envelope so the RV reflects the post-commit state.
+// This lets the rollback conflict check distinguish Janus's own writes from
+// external modifications.
+func (r *TransactionReconciler) updateRollbackRV(ctx context.Context, txn *backupv1alpha1.Transaction, change backupv1alpha1.ResourceChange, namespace string, cl client.Client) error {
+	obj, err := r.getResource(ctx, cl, change.Target, namespace)
+	if err != nil {
+		return err
+	}
+
+	rbKey := rollback.Key(change.Target.Kind, namespace, change.Target.Name)
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); err != nil {
+		return err
+	}
+
+	raw, ok := cm.Data[rbKey]
+	if !ok {
+		return nil // No envelope to update (e.g. Create change).
+	}
+
+	var env rollback.Envelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		return err
+	}
+	env.ResourceVersion = obj.GetResourceVersion()
+
+	data, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	cm.Data[rbKey] = string(data)
+	return r.Update(ctx, cm)
 }
 
 // --- Helpers ---
