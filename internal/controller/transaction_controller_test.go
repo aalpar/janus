@@ -1831,6 +1831,339 @@ var _ = Describe("Transaction Controller", func() {
 		})
 	})
 
+	Context("rollback edge cases", func() {
+		It("rollback with no conflicts reaches RolledBack", func() {
+			// Happy path: 2-item txn, item 0 = Patch, item 1 = blocker.
+			// No external modifications between commit and rollback.
+			// Rollback should succeed → RolledBack (not Failed).
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-edge-noconflict-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, err := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-edge-noconflict-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-edge-noconflict-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						blockerChange("rb-edge-noconflict-blocker"),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "rb-edge-noconflict-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0 (Patch).
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-noconflict-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-noconflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Verify patch was applied.
+			Expect(k8sClient.Get(ctx, nn("rb-edge-noconflict-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("patched"))
+
+			// Trigger rollback: item 1 lock renewal fails.
+			reconciler.LockMgr = failingRenewLockMgr()
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-noconflict-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-noconflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Roll back to completion.
+			reconcileToPhase(reconciler, "rb-edge-noconflict-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-noconflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			Expect(txn.Status.CompletedAt).NotTo(BeNil())
+			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
+			Expect(txn.Status.Items[0].Error).To(BeEmpty())
+
+			// Verify the ConfigMap was restored to original state.
+			Expect(k8sClient.Get(ctx, nn("rb-edge-noconflict-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("original"))
+
+			// Rollback ConfigMap still exists (OwnerRef GC cleans up on Transaction deletion).
+			rbCM := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{
+				Name: txn.Status.RollbackRef, Namespace: testNamespace,
+			}, rbCM)).To(Succeed())
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("Create rollback deletes the created resource", func() {
+			// 2-item txn: item 0 = Create (commits), item 1 = blocker (fails lock).
+			// Rollback of Create = Delete. Verify the created resource is removed.
+			createContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "rb-edge-create-cm",
+					"namespace": testNamespace,
+				},
+				"data": map[string]any{"k": "created"},
+			}
+			createRaw, err := json.Marshal(createContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-edge-create-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-edge-create-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: createRaw},
+						},
+						blockerChange("rb-edge-create-blocker"),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "rb-edge-create-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0 (Create).
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-create-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify the ConfigMap was created.
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, nn("rb-edge-create-cm"), cm)).To(Succeed())
+			Expect(cm.Data["k"]).To(Equal("created"))
+
+			// Trigger rollback: item 1 lock renewal fails.
+			reconciler.LockMgr = failingRenewLockMgr()
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-create-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-create-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Roll back to completion — Create rollback = Delete.
+			reconcileToPhase(reconciler, "rb-edge-create-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-create-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
+
+			// Verify the created ConfigMap was deleted during rollback.
+			err = k8sClient.Get(ctx, nn("rb-edge-create-cm"), cm)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("Patch rollback when target deleted externally re-creates via SSA Apply", func() {
+			// Patch committed, then target deleted externally before rollback.
+			// The reverse SSA Apply acts as an upsert — it re-creates the resource
+			// with the rolled-back field values.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-edge-patch-del-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, err := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-edge-patch-del-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-edge-patch-del-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						blockerChange("rb-edge-patch-del-blocker"),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "rb-edge-patch-del-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0 (Patch).
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-patch-del-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Delete the target externally before rollback.
+			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-cm"), cm)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+
+			// Trigger rollback: item 1 lock renewal fails.
+			reconciler.LockMgr = failingRenewLockMgr()
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-patch-del-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Rollback: SSA Apply on deleted resource acts as upsert → re-creates.
+			reconcileToPhase(reconciler, "rb-edge-patch-del-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
+
+			// SSA Apply re-created the resource with the original data value.
+			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("original"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("Update rollback re-creates when target deleted externally", func() {
+			// Update committed, then target deleted externally before rollback.
+			// applyRollback for Update detects NotFound and falls back to Create
+			// from the stored prior state.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-edge-upd-del-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			updateContent, err := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "rb-edge-upd-del-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "updated"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-edge-upd-del-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-edge-upd-del-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeUpdate,
+							Content: runtime.RawExtension{Raw: updateContent},
+						},
+						blockerChange("rb-edge-upd-del-blocker"),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "rb-edge-upd-del-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0 (Update).
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-upd-del-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-upd-del-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Verify Update was applied.
+			Expect(k8sClient.Get(ctx, nn("rb-edge-upd-del-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("updated"))
+
+			// Delete the target externally before rollback.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+
+			// Trigger rollback: item 1 lock renewal fails.
+			reconciler.LockMgr = failingRenewLockMgr()
+			_, err = reconciler.Reconcile(ctx, req("rb-edge-upd-del-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-upd-del-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Rollback: Update detects NotFound → falls back to Create from prior state.
+			reconcileToPhase(reconciler, "rb-edge-upd-del-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			Expect(k8sClient.Get(ctx, nn("rb-edge-upd-del-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
+
+			// Verify the resource was re-created with the original data.
+			Expect(k8sClient.Get(ctx, nn("rb-edge-upd-del-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("original"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
 	Context("conflict detection", func() {
 		It("should store resourceVersion in ItemStatus during prepare", func() {
 			cm := &corev1.ConfigMap{
