@@ -823,10 +823,6 @@ func rollbackKey(ref backupv1alpha1.ResourceRef, namespace string) string {
 	return fmt.Sprintf("%s_%s_%s", ref.Kind, namespace, ref.Name)
 }
 
-// cleanForRestore strips cluster-assigned metadata from a resource so it can
-// be re-created or updated in the cluster. OwnerReferences and finalizers are
-// preserved — they were part of the original resource state and are needed to
-// maintain GC chains and external controller contracts.
 // loadRollbackState retrieves and deserializes a resource's prior state from the rollback ConfigMap.
 func loadRollbackState(rbCM *corev1.ConfigMap, rbKey, namespace string) (*unstructured.Unstructured, error) {
 	data, ok := rbCM.Data[rbKey]
@@ -841,6 +837,10 @@ func loadRollbackState(rbCM *corev1.ConfigMap, rbKey, namespace string) (*unstru
 	return obj, nil
 }
 
+// cleanForRestore strips cluster-assigned metadata from a resource so it can
+// be re-created or updated in the cluster. OwnerReferences and finalizers are
+// preserved — they were part of the original resource state and are needed to
+// maintain GC chains and external controller contracts.
 func cleanForRestore(obj *unstructured.Unstructured, targetNS string) {
 	obj.SetResourceVersion("")
 	obj.SetUID("")
