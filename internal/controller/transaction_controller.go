@@ -42,6 +42,7 @@ import (
 	"github.com/aalpar/janus/internal/impersonate"
 	"github.com/aalpar/janus/internal/lock"
 	txmetrics "github.com/aalpar/janus/internal/metrics"
+	"github.com/aalpar/janus/internal/rollback"
 )
 
 const (
@@ -586,7 +587,7 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Clien
 
 // applyRollback reverses a committed change using the stored prior state.
 func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace string, rbCM *corev1.ConfigMap) error {
-	rbKey := rollbackKey(change.Target, namespace)
+	rbKey := rollback.Key(change.Target.Kind, namespace, change.Target.Name)
 
 	switch change.Type {
 	case backupv1alpha1.ChangeTypeCreate:
@@ -655,7 +656,7 @@ func (r *TransactionReconciler) unmarshalContent(raw runtime.RawExtension, ref b
 
 func (r *TransactionReconciler) saveRollbackState(ctx context.Context, txn *backupv1alpha1.Transaction, change backupv1alpha1.ResourceChange, obj *unstructured.Unstructured) error {
 	ns := r.resolveNamespace(change.Target, txn.Namespace)
-	key := rollbackKey(change.Target, ns)
+	key := rollback.Key(change.Target.Kind, ns, change.Target.Name)
 
 	data, err := json.Marshal(obj.Object)
 	if err != nil {
@@ -814,13 +815,6 @@ func (r *TransactionReconciler) hasUnrolledCommits(txn *backupv1alpha1.Transacti
 		}
 	}
 	return false
-}
-
-// rollbackKey produces the ConfigMap key for a resource's rollback state.
-// Uses underscores as separators — K8s resource names (DNS-1123) and Kind values
-// never contain underscores, so this is collision-free.
-func rollbackKey(ref backupv1alpha1.ResourceRef, namespace string) string {
-	return fmt.Sprintf("%s_%s_%s", ref.Kind, namespace, ref.Name)
 }
 
 // loadRollbackState retrieves and deserializes a resource's prior state from the rollback ConfigMap.
