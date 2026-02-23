@@ -1,16 +1,20 @@
 # Janus
 
-A Kubernetes operator that executes atomic multi-resource changes using the
+A Kubernetes operator that coordinates multi-resource changes using the
 [Saga pattern](https://dl.acm.org/doi/10.1145/38714.38742) with
-Lease-based advisory locking.
+Lease-based advisory locking and optimistic conflict detection.
 
 ## Goals
 
-Janus provides atomic multi-resource mutations for Kubernetes:
+Janus coordinates multi-resource mutations for Kubernetes:
 
-- **Atomic multi-resource mutations.** A `Transaction` groups an ordered list
-  of create, update, patch, and delete operations. Either all succeed or all
-  committed changes are reverted.
+- **Coordinated multi-resource mutations.** A `Transaction` groups an ordered
+  list of create, update, patch, and delete operations. Either all succeed or
+  all committed changes are reverted. Consistency is best-effort: advisory
+  locking prevents conflicts between cooperating actors, and optimistic
+  conflict detection (via `resourceVersion`) catches external modifications,
+  but Janus cannot prevent non-cooperating actors from writing to resources
+  mid-transaction.
 - **Crash-resilient progress.** The controller processes one item per reconcile
   cycle, persisting status to the API server after each step. A controller
   restart resumes from the last recorded checkpoint.
@@ -61,19 +65,22 @@ Janus provides atomic multi-resource mutations for Kubernetes:
 > This design maximizes system resilience, extensibility, and horizontal
 > scalability. It works well for the vast majority of Kubernetes use cases.
 
-Janus extends Kubernetes where transactional semantics are needed. It does not
-replace or contradict Kubernetes' design — it adds an optional layer for
-scenarios where atomic multi-resource changes are a business requirement. If
-your use case tolerates eventual consistency (and most do), standard Kubernetes
-primitives are the right tool.
+Janus extends Kubernetes where coordinated multi-resource changes are needed.
+It does not replace or contradict Kubernetes' design — it adds an optional
+coordination layer that operates within Kubernetes' eventual consistency model.
+Janus reduces the inconsistency window and provides rollback capability, but
+it cannot enforce isolation or prevent concurrent writes from non-cooperating
+actors. If your use case tolerates uncoordinated eventual consistency (and most
+do), standard Kubernetes primitives are the right tool.
 
 ### The problem
 
 Many Kubernetes operations require coordinated changes across multiple
 resources. Deploying a new application version might involve updating a
 ConfigMap, patching a Deployment image, and deleting a stale Secret. These
-changes are semantically atomic — partial application leaves the cluster in an
-inconsistent state — but Kubernetes treats each resource write independently.
+changes are semantically related — partial application leaves the cluster in a
+temporarily inconsistent state — but Kubernetes treats each resource write
+independently.
 
 Existing approaches handle this incompletely:
 
