@@ -2609,6 +2609,347 @@ var _ = Describe("Transaction Controller", func() {
 			}
 		})
 	})
+
+	Context("when rolling back an Update (full replace)", func() {
+		It("should restore the original resource state", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-update-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"old-key": "old-val"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			updateContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "rb-update-cm",
+					"namespace": testNamespace,
+				},
+				"data": map[string]any{
+					"new-key": "new-val",
+				},
+			}
+			updateRaw, _ := json.Marshal(updateContent)
+
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "rb-update-blocker", "namespace": testNamespace},
+				"data":       map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-update-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-update-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeUpdate,
+							Content: runtime.RawExtension{Raw: updateRaw},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "rb-update-blocker",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			// Progress to Committing and commit item 0 (Update).
+			reconcileToPhase(reconciler, "rb-update-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "rb-update-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify item 0 committed — full replace applied.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rb-update-cm", Namespace: testNamespace}, cm)).To(Succeed())
+			Expect(cm.Data).To(HaveKey("new-key"))
+			Expect(cm.Data).NotTo(HaveKey("old-key"))
+
+			// Fail item 1's lock check → triggers rollback.
+			reconciler.LockMgr = &fakeLockMgr{
+				renewFn: func(_ context.Context, lease lock.LeaseRef, _ string, _ time.Duration) error {
+					return &lock.ErrLockExpired{LeaseName: lease.Name}
+				},
+			}
+
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "rb-update-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Rollback should restore the original state.
+			reconcileToPhase(reconciler, "rb-update-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rb-update-cm", Namespace: testNamespace}, cm)).To(Succeed())
+			Expect(cm.Data["old-key"]).To(Equal("old-val"))
+			Expect(cm.Data).NotTo(HaveKey("new-key"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("conflict detection for Update (optimistic concurrency)", func() {
+		It("should fail when the resource is modified between prepare and commit", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-update-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			updateContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "conflict-update-cm",
+					"namespace": testNamespace,
+				},
+				"data": map[string]any{"key": "updated"},
+			}
+			raw, _ := json.Marshal(updateContent)
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "conflict-update-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "conflict-update-cm",
+							Namespace:  testNamespace,
+						},
+						Type:    backupv1alpha1.ChangeTypeUpdate,
+						Content: runtime.RawExtension{Raw: raw},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			reconcileToPhase(reconciler, "conflict-update-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// External actor modifies the resource after prepare.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-update-cm", Namespace: testNamespace,
+			}, cm)).To(Succeed())
+			cm.Data["key"] = "externally-modified"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+			// Reconcile through Committing — should detect conflict and fail.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name: "conflict-update-txn", Namespace: testNamespace,
+				}, txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted {
+					break
+				}
+				_, _ = reconciler.Reconcile(ctx, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Name: "conflict-update-txn", Namespace: testNamespace,
+					},
+				})
+			}
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "conflict-update-txn", Namespace: testNamespace,
+			}, txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			// Verify the failure mentions conflict.
+			failedCond := apimeta.FindStatusCondition(txn.Status.Conditions, "Failed")
+			Expect(failedCond).NotTo(BeNil())
+			Expect(failedCond.Message).To(ContainSubstring("conflict"))
+
+			// Verify metrics.
+			Expect(testutil.ToFloat64(txmetrics.ItemOperations.WithLabelValues("commit", "conflict"))).To(BeNumerically(">", 0))
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("status conditions on rollback", func() {
+		It("should set RolledBack condition when rollback completes", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cond-rb-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, _ := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+			create2Raw, _ := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "cond-rb-blocker", "namespace": testNamespace},
+				"data":       map[string]any{"k": "v"},
+			})
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cond-rb-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "cond-rb-cm",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						{
+							Target: backupv1alpha1.ResourceRef{
+								APIVersion: "v1",
+								Kind:       "ConfigMap",
+								Name:       "cond-rb-blocker",
+								Namespace:  testNamespace,
+							},
+							Type:    backupv1alpha1.ChangeTypeCreate,
+							Content: runtime.RawExtension{Raw: create2Raw},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			reconcileToPhase(reconciler, "cond-rb-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0.
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "cond-rb-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Trigger rollback.
+			reconciler.LockMgr = &fakeLockMgr{
+				renewFn: func(_ context.Context, lease lock.LeaseRef, _ string, _ time.Duration) error {
+					return &lock.ErrLockExpired{LeaseName: lease.Name}
+				},
+			}
+
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "cond-rb-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			reconcileToPhase(reconciler, "cond-rb-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cond-rb-txn", Namespace: testNamespace}, txn)).To(Succeed())
+
+			rbCond := apimeta.FindStatusCondition(txn.Status.Conditions, "RolledBack")
+			Expect(rbCond).NotTo(BeNil())
+			Expect(rbCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(rbCond.Reason).To(Equal("RollbackComplete"))
+
+			// CompletedAt should be set.
+			Expect(txn.Status.CompletedAt).NotTo(BeNil())
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("custom lock timeout", func() {
+		It("should pass the configured lockTimeout to the lock manager", func() {
+			var acquiredTimeout time.Duration
+			reconciler.LockMgr = &fakeLockMgr{
+				acquireFn: func(_ context.Context, key lock.ResourceKey, _ string, timeout time.Duration) (string, error) {
+					acquiredTimeout = timeout
+					return lock.LeaseName(key), nil
+				},
+			}
+
+			cmContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "lock-timeout-cm", "namespace": testNamespace},
+				"data":       map[string]any{"k": "v"},
+			}
+			raw, _ := json.Marshal(cmContent)
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "lock-timeout-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					LockTimeout:        &metav1.Duration{Duration: 42 * time.Second},
+					Changes: []backupv1alpha1.ResourceChange{{
+						Target: backupv1alpha1.ResourceRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "lock-timeout-cm",
+							Namespace:  testNamespace,
+						},
+						Type:    backupv1alpha1.ChangeTypeCreate,
+						Content: runtime.RawExtension{Raw: raw},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Drive through finalizer and Pending → Preparing.
+			reconcileToPhase(reconciler, "lock-timeout-txn", backupv1alpha1.TransactionPhasePreparing)
+
+			// Reconcile once more to prepare the item (triggers Acquire).
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: "lock-timeout-txn", Namespace: testNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(acquiredTimeout).To(Equal(42 * time.Second))
+
+			// Clean up created ConfigMap.
+			cm := &corev1.ConfigMap{}
+			_ = k8sClient.Get(ctx, types.NamespacedName{Name: "lock-timeout-cm", Namespace: testNamespace}, cm)
+			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
+		})
+	})
 })
 
 // reconcileToPhase drives the reconciler until the transaction reaches the target phase.
