@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -472,6 +473,10 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		if !item.Committed || item.RolledBack {
 			continue
 		}
+		// Skip items already marked as conflict from a previous reconcile cycle.
+		if strings.Contains(item.Error, "rollback conflict") {
+			continue
+		}
 
 		change := txn.Spec.Changes[i]
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
@@ -479,17 +484,23 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		if err := r.applyRollback(ctx, userClient, change, ns, rbCM, txn.Name); err != nil {
 			var conflictErr *ErrRollbackConflict
 			if errors.As(err, &conflictErr) {
+				// Conflict: record on item, skip, continue to next item.
 				txmetrics.ItemOperations.WithLabelValues("rollback", "conflict").Inc()
 				item.Error = err.Error()
-				log.Error(err, "rollback conflict detected, failing transaction", "item", i)
+				log.Info("rollback conflict detected, skipping item", "item", i,
+					"kind", change.Target.Kind, "name", change.Target.Name)
 				r.event(txn, corev1.EventTypeWarning, "RollbackConflict",
 					"item %d: %s — manual intervention required via janus recover", i, err)
-				return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+				// Requeue to continue with remaining items.
+				return r.updateStatusAndRequeue(ctx, txn)
 			}
+			// Non-conflict error: transient, retry.
 			txmetrics.ItemOperations.WithLabelValues("rollback", "error").Inc()
 			item.Error = fmt.Sprintf("rollback failed: %v", err)
 			log.Error(err, "rollback failed for item, will retry", "item", i)
-			r.event(txn, corev1.EventTypeWarning, "RollbackFailed", "item %d: rollback failed for %s/%s, will retry: %v", i, change.Target.Kind, change.Target.Name, err)
+			r.event(txn, corev1.EventTypeWarning, "RollbackFailed",
+				"item %d: rollback failed for %s/%s, will retry: %v",
+				i, change.Target.Kind, change.Target.Name, err)
 			if statusErr := r.Status().Update(ctx, txn); statusErr != nil {
 				log.Error(statusErr, "failed to persist rollback error on item status", "item", i)
 			}
@@ -505,12 +516,34 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		return r.updateStatusAndRequeue(ctx, txn)
 	}
 
-	// All rolled back — release locks, preserve rollback CM for forensics.
-	log.Info("rollback complete, releasing locks")
+	// All items processed. Check for unresolved conflicts.
+	hasConflicts := false
+	for i := range txn.Status.Items {
+		if txn.Status.Items[i].Committed && !txn.Status.Items[i].RolledBack {
+			hasConflicts = true
+			break
+		}
+	}
+
+	// Release locks regardless of conflict outcome.
+	log.Info("rollback loop complete, releasing locks")
 	r.releaseAllLocks(ctx, txn)
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
+
+	if hasConflicts {
+		log.Info("rollback completed with conflicts, marking failed")
+		r.event(txn, corev1.EventTypeWarning, "RollbackPartial",
+			"rollback completed with conflicts; manual intervention required via janus recover")
+		if txn.Status.StartedAt != nil {
+			txmetrics.Duration.WithLabelValues("Failed").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
+		}
+		return ctrl.Result{}, r.setFailed(ctx, txn,
+			"rollback completed with conflicts; use janus recover to resolve remaining items")
+	}
+
+	log.Info("rollback complete")
 	if txn.Status.StartedAt != nil {
 		txmetrics.Duration.WithLabelValues("RolledBack").Observe(time.Since(txn.Status.StartedAt.Time).Seconds())
 	}

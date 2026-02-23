@@ -1799,16 +1799,24 @@ var _ = Describe("Transaction Controller", func() {
 			origCM.Data["key"] = "txn-b-modified"
 			Expect(k8sClient.Update(ctx, origCM)).To(Succeed())
 
-			// TxnA auto-recovers and attempts rollback — detects RV mismatch → Failed.
-			// Recovery transitions Failed→RollingBack, then rollback detects conflict.
-			_, err = reconciler.Reconcile(ctx, req("staledata-txn"))
-			Expect(err).NotTo(HaveOccurred()) // Failed→RollingBack transition
+			// TxnA auto-recovers and attempts rollback — detects RV mismatch.
+			// Can't use reconcileToPhase here: it checks phase before reconciling,
+			// and we're already in Failed. We need to drive through the recovery
+			// path explicitly: Failed → RollingBack → conflict → Failed.
 
+			// Reconcile 1: recovery detects un-rolled-back commit → RollingBack.
+			_, err = reconciler.Reconcile(ctx, req("staledata-txn"))
+			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, nn("staledata-txn"), txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
 
+			// Reconcile 2: conflict on item 0 (RV mismatch), records error, requeues.
 			_, err = reconciler.Reconcile(ctx, req("staledata-txn"))
-			Expect(err).NotTo(HaveOccurred()) // RollingBack→Failed (conflict detected)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile 3: item 0 skipped (has conflict), all done → Failed.
+			_, err = reconciler.Reconcile(ctx, req("staledata-txn"))
+			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("staledata-txn"), txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
@@ -2743,9 +2751,8 @@ var _ = Describe("Transaction Controller", func() {
 			cm.Data["key"] = "externally-modified"
 			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
 
-			// 5. Reconcile rollback — should detect RV mismatch and transition to Failed.
-			_, err = reconciler.Reconcile(ctx, req("rbconflict-txn"))
-			Expect(err).NotTo(HaveOccurred())
+			// 5. Reconcile rollback — detects conflict, continues past it, then Failed.
+			reconcileToPhase(reconciler, "rbconflict-txn", backupv1alpha1.TransactionPhaseFailed)
 
 			// 6. Assert: phase=Failed, item[0].Error contains "rollback conflict".
 			Expect(k8sClient.Get(ctx, nn("rbconflict-txn"), txn)).To(Succeed())
@@ -2756,7 +2763,7 @@ var _ = Describe("Transaction Controller", func() {
 			failedCond := apimeta.FindStatusCondition(txn.Status.Conditions, "Failed")
 			Expect(failedCond).NotTo(BeNil())
 			Expect(failedCond.Status).To(Equal(metav1.ConditionTrue))
-			Expect(failedCond.Message).To(ContainSubstring("rollback conflict"))
+			Expect(failedCond.Message).To(ContainSubstring("conflicts"))
 
 			// Verify the CM still has the external modification (not clobbered).
 			Expect(k8sClient.Get(ctx, nn("rbconflict-cm"), cm)).To(Succeed())
@@ -2850,6 +2857,124 @@ var _ = Describe("Transaction Controller", func() {
 
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, target)).To(Succeed())
+		})
+	})
+
+	Context("continue-past-conflicts rollback", func() {
+		It("should skip conflicted Update items and still roll back Patch items", func() {
+			// 3-item txn: Patch (0) + Update (1) + blocker Create (2).
+			// Reverse iteration hits Update (1) first → conflict → must skip.
+			// Then Patch (0) → reverse SSA → success. Final: Failed.
+			// This ordering is critical: with stop-on-first, item 0 would never
+			// get rolled back because the conflict on item 1 stops everything.
+
+			for _, name := range []string{"cpc-patch-cm", "cpc-upd-cm"} {
+				cm := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+					Data:       map[string]string{"key": "original"},
+				}
+				Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+			}
+
+			patchContent, err := json.Marshal(map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "cpc-patch-cm", "namespace": testNamespace},
+				"data":     map[string]any{"key": "patched"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			updContent, err := json.Marshal(map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "cpc-upd-cm", "namespace": testNamespace},
+				"data":     map[string]any{"key": "updated"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{Name: "cpc-txn", Namespace: testNamespace},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "cpc-patch-cm"},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: patchContent},
+						},
+						{
+							Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "cpc-upd-cm"},
+							Type:    backupv1alpha1.ChangeTypeUpdate,
+							Content: runtime.RawExtension{Raw: updContent},
+						},
+						blockerChange("cpc-blocker"),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Real lock manager for prepare and commits.
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			// Drive to Committing.
+			reconcileToPhase(reconciler, "cpc-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0 (Patch).
+			_, err = reconciler.Reconcile(ctx, req("cpc-txn"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, nn("cpc-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Commit item 1 (Update).
+			_, err = reconciler.Reconcile(ctx, req("cpc-txn"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, nn("cpc-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[1].Committed).To(BeTrue())
+
+			// Externally modify item 1's target (bump RV past what envelope recorded).
+			target1 := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, nn("cpc-upd-cm"), target1)).To(Succeed())
+			target1.Data["key"] = "externally-modified"
+			Expect(k8sClient.Update(ctx, target1)).To(Succeed())
+
+			// Failing lock manager → item 2 lock renewal fails → RollingBack.
+			reconciler.LockMgr = failingRenewLockMgr()
+			_, err = reconciler.Reconcile(ctx, req("cpc-txn"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, nn("cpc-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Reconcile through rollback to completion (Failed due to conflict).
+			reconcileToPhase(reconciler, "cpc-txn", backupv1alpha1.TransactionPhaseFailed)
+
+			Expect(k8sClient.Get(ctx, nn("cpc-txn"), txn)).To(Succeed())
+
+			// Item 0 (Patch): rolled back via reverse SSA despite item 1's conflict.
+			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
+
+			// Item 1 (Update): conflict, not rolled back.
+			Expect(txn.Status.Items[1].RolledBack).To(BeFalse())
+			Expect(txn.Status.Items[1].Error).To(ContainSubstring("rollback conflict"))
+
+			// Rollback ConfigMap preserved for recovery CLI.
+			rbCM := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{
+				Name: txn.Status.RollbackRef, Namespace: testNamespace,
+			}, rbCM)).To(Succeed())
+
+			// Item 0's target restored.
+			target0 := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, nn("cpc-patch-cm"), target0)).To(Succeed())
+			Expect(target0.Data["key"]).To(Equal("original"))
+
+			// Item 1's target still has external modification.
+			Expect(k8sClient.Get(ctx, nn("cpc-upd-cm"), target1)).To(Succeed())
+			Expect(target1.Data["key"]).To(Equal("externally-modified"))
+
+			// Clean up.
+			for _, name := range []string{"cpc-patch-cm", "cpc-upd-cm"} {
+				cm := &corev1.ConfigMap{}
+				_ = k8sClient.Get(ctx, nn(name), cm)
+				_ = k8sClient.Delete(ctx, cm)
+			}
 		})
 	})
 })
