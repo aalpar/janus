@@ -3090,7 +3090,7 @@ var _ = Describe("cleanForRestore", func() {
 			},
 		}
 
-		cleanForRestore(obj, "new-ns")
+		rollback.CleanForRestore(obj, "new-ns")
 
 		Expect(obj.GetResourceVersion()).To(Equal(""))
 		Expect(string(obj.GetUID())).To(Equal(""))
@@ -3122,7 +3122,7 @@ var _ = Describe("cleanForRestore", func() {
 			},
 		}
 
-		cleanForRestore(obj, "")
+		rollback.CleanForRestore(obj, "")
 		Expect(obj.GetNamespace()).To(Equal("original"))
 	})
 })

@@ -1015,24 +1015,8 @@ func loadRollbackState(rbCM *corev1.ConfigMap, rbKey, namespace string) (*unstru
 	if err := json.Unmarshal(env.PriorState, &obj.Object); err != nil {
 		return nil, "", &RollbackDataError{Key: rbKey, Err: err}
 	}
-	cleanForRestore(obj, namespace)
+	rollback.CleanForRestore(obj, namespace)
 	return obj, env.ResourceVersion, nil
-}
-
-// cleanForRestore strips cluster-assigned metadata from a resource so it can
-// be re-created or updated in the cluster. OwnerReferences and finalizers are
-// preserved — they were part of the original resource state and are needed to
-// maintain GC chains and external controller contracts.
-func cleanForRestore(obj *unstructured.Unstructured, targetNS string) {
-	obj.SetResourceVersion("")
-	obj.SetUID("")
-	obj.SetCreationTimestamp(metav1.Time{})
-	obj.SetGeneration(0)
-	obj.SetManagedFields(nil)
-	delete(obj.Object, "status")
-	if targetNS != "" {
-		obj.SetNamespace(targetNS)
-	}
 }
 
 // computeReversePatch takes a forward patch and the full prior state, and

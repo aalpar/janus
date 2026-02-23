@@ -8,7 +8,6 @@ import (
 	"github.com/aalpar/janus/internal/rollback"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -86,12 +85,7 @@ func applyRestore(ctx context.Context, cl client.Client, target rollback.MetaTar
 	obj.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: gv.Group, Version: gv.Version, Kind: target.Kind,
 	})
-	if target.Namespace != "" {
-		obj.SetNamespace(target.Namespace)
-	}
-
-	// Strip server-managed fields before applying (mirrors controller cleanForRestore).
-	cleanForRestore(obj)
+	rollback.CleanForRestore(obj, target.Namespace)
 
 	// Fetch current state to decide between create and update.
 	existing, err := targetToUnstructured(target)
@@ -135,15 +129,4 @@ func targetToUnstructured(target rollback.MetaTarget) (*unstructured.Unstructure
 	obj.SetName(target.Name)
 	obj.SetNamespace(target.Namespace)
 	return obj, nil
-}
-
-// cleanForRestore strips server-managed fields from a resource before applying.
-// This mirrors the controller's cleanForRestore logic.
-func cleanForRestore(obj *unstructured.Unstructured) {
-	obj.SetResourceVersion("")
-	obj.SetUID("")
-	obj.SetCreationTimestamp(metav1.Time{})
-	obj.SetGeneration(0)
-	obj.SetManagedFields(nil)
-	delete(obj.Object, "status")
 }

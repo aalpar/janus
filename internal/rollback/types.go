@@ -5,6 +5,9 @@ package rollback
 import (
 	"encoding/json"
 	"fmt"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // MetaKey is the ConfigMap data key that holds transaction-level metadata.
@@ -59,4 +62,19 @@ type MetaTarget struct {
 // namespace, and name.
 func Key(kind, namespace, name string) string {
 	return fmt.Sprintf("%s_%s_%s", kind, namespace, name)
+}
+
+// CleanForRestore strips server-managed fields from an Unstructured object
+// so it can be used for a restore (Update or Create). If targetNS is
+// non-empty, the object's namespace is overridden.
+func CleanForRestore(obj *unstructured.Unstructured, targetNS string) {
+	obj.SetResourceVersion("")
+	obj.SetUID("")
+	obj.SetCreationTimestamp(metav1.Time{})
+	obj.SetGeneration(0)
+	obj.SetManagedFields(nil)
+	delete(obj.Object, "status")
+	if targetNS != "" {
+		obj.SetNamespace(targetNS)
+	}
 }
