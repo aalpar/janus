@@ -314,6 +314,26 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
 				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: saving rollback state: %v", i, err))
 			}
+		} else {
+			// Create changes have no prior state, but store an envelope so the
+			// CLI knows rollback = delete.
+			env := rollback.Envelope{ChangeType: string(change.Type)}
+			envData, err := json.Marshal(env)
+			if err != nil {
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: serializing create envelope: %v", i, err))
+			}
+			cm := &corev1.ConfigMap{}
+			if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); err != nil {
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: fetching rollback ConfigMap: %v", i, err))
+			}
+			if cm.Data == nil {
+				cm.Data = make(map[string]string)
+			}
+			key := rollback.Key(change.Target.Kind, ns, change.Target.Name)
+			cm.Data[key] = string(envData)
+			if err := r.Update(ctx, cm); err != nil {
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: saving create envelope: %v", i, err))
+			}
 		}
 
 		txmetrics.ItemOperations.WithLabelValues("prepare", "success").Inc()
@@ -603,7 +623,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 	case backupv1alpha1.ChangeTypeDelete:
 		// Reverse of Delete = re-Create from rollback state.
-		obj, err := loadRollbackState(rbCM, rbKey, namespace)
+		obj, _, err := loadRollbackState(rbCM, rbKey, namespace)
 		if err != nil {
 			return err
 		}
@@ -617,7 +637,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 	case backupv1alpha1.ChangeTypeUpdate, backupv1alpha1.ChangeTypePatch:
 		// Reverse = restore the previous state.
-		obj, err := loadRollbackState(rbCM, rbKey, namespace)
+		obj, _, err := loadRollbackState(rbCM, rbKey, namespace)
 		if err != nil {
 			return err
 		}
@@ -658,9 +678,19 @@ func (r *TransactionReconciler) saveRollbackState(ctx context.Context, txn *back
 	ns := r.resolveNamespace(change.Target, txn.Namespace)
 	key := rollback.Key(change.Target.Kind, ns, change.Target.Name)
 
-	data, err := json.Marshal(obj.Object)
+	priorState, err := json.Marshal(obj.Object)
 	if err != nil {
 		return &ResourceOpError{Op: "serializing rollback state", Err: err}
+	}
+
+	env := rollback.Envelope{
+		ResourceVersion: obj.GetResourceVersion(),
+		ChangeType:      string(change.Type),
+		PriorState:      priorState,
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return &ResourceOpError{Op: "serializing rollback envelope", Err: err}
 	}
 
 	cm := &corev1.ConfigMap{}
@@ -818,17 +848,28 @@ func (r *TransactionReconciler) hasUnrolledCommits(txn *backupv1alpha1.Transacti
 }
 
 // loadRollbackState retrieves and deserializes a resource's prior state from the rollback ConfigMap.
-func loadRollbackState(rbCM *corev1.ConfigMap, rbKey, namespace string) (*unstructured.Unstructured, error) {
+// It returns the prior-state object (nil for Create envelopes), the stored resourceVersion, and any error.
+func loadRollbackState(rbCM *corev1.ConfigMap, rbKey, namespace string) (*unstructured.Unstructured, string, error) {
 	data, ok := rbCM.Data[rbKey]
 	if !ok {
-		return nil, &RollbackDataError{Key: rbKey}
+		return nil, "", &RollbackDataError{Key: rbKey}
 	}
+
+	var env rollback.Envelope
+	if err := json.Unmarshal([]byte(data), &env); err != nil {
+		return nil, "", &RollbackDataError{Key: rbKey, Err: err}
+	}
+
+	if env.PriorState == nil {
+		return nil, env.ResourceVersion, nil
+	}
+
 	obj := &unstructured.Unstructured{}
-	if err := json.Unmarshal([]byte(data), &obj.Object); err != nil {
-		return nil, &RollbackDataError{Key: rbKey, Err: err}
+	if err := json.Unmarshal(env.PriorState, &obj.Object); err != nil {
+		return nil, "", &RollbackDataError{Key: rbKey, Err: err}
 	}
 	cleanForRestore(obj, namespace)
-	return obj, nil
+	return obj, env.ResourceVersion, nil
 }
 
 // cleanForRestore strips cluster-assigned metadata from a resource so it can
