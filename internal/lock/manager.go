@@ -72,51 +72,67 @@ func LeaseName(key ResourceKey) string {
 	)
 }
 
+// holderOf returns the holder identity of a lease, or empty string if unset.
+func holderOf(lease *coordinationv1.Lease) string {
+	if lease.Spec.HolderIdentity != nil {
+		return *lease.Spec.HolderIdentity
+	}
+	return ""
+}
+
+// setLeaseTime sets the renew time and lease duration on a lease.
+// Returns the timestamp used so callers can reuse it (e.g. for AcquireTime).
+func setLeaseTime(lease *coordinationv1.Lease, timeout time.Duration) metav1.MicroTime {
+	now := metav1.NewMicroTime(time.Now())
+	durationSec := int32(timeout.Seconds())
+	lease.Spec.RenewTime = &now
+	lease.Spec.LeaseDurationSeconds = &durationSec
+	return now
+}
+
+func (m *LeaseManager) createLease(ctx context.Context, key ResourceKey, name, txnName string, timeout time.Duration) (string, error) {
+	now := metav1.NewMicroTime(time.Now())
+	durationSec := int32(timeout.Seconds())
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: key.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "janus",
+				"janus.io/transaction":         txnName,
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &txnName,
+			LeaseDurationSeconds: &durationSec,
+			AcquireTime:          &now,
+			RenewTime:            &now,
+		},
+	}
+	if err := m.Client.Create(ctx, lease); err != nil {
+		return "", &LeaseOpError{Op: "creating", LeaseName: name, Err: err}
+	}
+	return name, nil
+}
+
 func (m *LeaseManager) Acquire(ctx context.Context, key ResourceKey, txnName string, timeout time.Duration) (string, error) {
 	name := LeaseName(key)
-	durationSec := int32(timeout.Seconds())
-	now := metav1.NewMicroTime(time.Now())
 
 	lease := &coordinationv1.Lease{}
 	err := m.Client.Get(ctx, client.ObjectKey{Name: name, Namespace: key.Namespace}, lease)
 
 	if apierrors.IsNotFound(err) {
-		// No existing lease — create one.
-		lease = &coordinationv1.Lease{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: key.Namespace,
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "janus",
-					"janus.io/transaction":         txnName,
-				},
-			},
-			Spec: coordinationv1.LeaseSpec{
-				HolderIdentity:       &txnName,
-				LeaseDurationSeconds: &durationSec,
-				AcquireTime:          &now,
-				RenewTime:            &now,
-			},
-		}
-		if err := m.Client.Create(ctx, lease); err != nil {
-			return "", &LeaseOpError{Op: "creating", LeaseName: name, Err: err}
-		}
-		return name, nil
+		return m.createLease(ctx, key, name, txnName, timeout)
 	}
 	if err != nil {
 		return "", &LeaseOpError{Op: "getting", LeaseName: name, Err: err}
 	}
 
-	// Lease exists — check holder.
-	holder := ""
-	if lease.Spec.HolderIdentity != nil {
-		holder = *lease.Spec.HolderIdentity
-	}
+	holder := holderOf(lease)
 
 	if holder == txnName {
 		// Already held by this transaction — renew.
-		lease.Spec.RenewTime = &now
-		lease.Spec.LeaseDurationSeconds = &durationSec
+		setLeaseTime(lease, timeout)
 		if err := m.Client.Update(ctx, lease); err != nil {
 			return "", &LeaseOpError{Op: "renewing", LeaseName: name, Err: err}
 		}
@@ -130,9 +146,8 @@ func (m *LeaseManager) Acquire(ctx context.Context, key ResourceKey, txnName str
 
 	// Expired — force takeover.
 	lease.Spec.HolderIdentity = &txnName
-	lease.Spec.LeaseDurationSeconds = &durationSec
+	now := setLeaseTime(lease, timeout)
 	lease.Spec.AcquireTime = &now
-	lease.Spec.RenewTime = &now
 	lease.Labels["janus.io/transaction"] = txnName
 	if err := m.Client.Update(ctx, lease); err != nil {
 		return "", &LeaseOpError{Op: "taking over expired", LeaseName: name, Err: err}
@@ -176,21 +191,14 @@ func (m *LeaseManager) Renew(ctx context.Context, lease LeaseRef, txnName string
 		return &LeaseOpError{Op: "getting", LeaseName: lease.Name, Err: err}
 	}
 
-	holder := ""
-	if existing.Spec.HolderIdentity != nil {
-		holder = *existing.Spec.HolderIdentity
-	}
-	if holder != txnName {
+	if holder := holderOf(existing); holder != txnName {
 		return &ErrAlreadyLocked{LeaseName: lease.Name, Holder: holder}
 	}
 	if m.isExpired(existing) {
 		return &ErrLockExpired{LeaseName: lease.Name}
 	}
 
-	now := metav1.NewMicroTime(time.Now())
-	durationSec := int32(timeout.Seconds())
-	existing.Spec.RenewTime = &now
-	existing.Spec.LeaseDurationSeconds = &durationSec
+	setLeaseTime(existing, timeout)
 	if err := m.Client.Update(ctx, existing); err != nil {
 		return &LeaseOpError{Op: "renewing", LeaseName: lease.Name, Err: err}
 	}
