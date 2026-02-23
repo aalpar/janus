@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -147,6 +148,28 @@ func LoadImageToKindClusterWithName(name string) error {
 	cmd := exec.Command(kindBinary, kindOptions...)
 	_, err := Run(cmd)
 	return err
+}
+
+// LoadImageToK0s imports a local docker image into the k0s containerd store.
+// Requires sudo access to the k0s containerd socket.
+func LoadImageToK0s(name string) error {
+	cmd := exec.Command("sudo", "k0s", "ctr", "images", "import", "-")
+	cmd.Stdin, _ = dockerSave(name)
+	_, err := Run(cmd)
+	return err
+}
+
+// dockerSave returns a reader for the docker-save tarball of the named image.
+func dockerSave(name string) (io.Reader, error) {
+	cmd := exec.Command("docker", "save", name)
+	dir, _ := GetProjectDir()
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker save %s: %w", name, err)
+	}
+	return bytes.NewReader(out), nil
 }
 
 // GetNonEmptyLines converts given command output string into individual objects
