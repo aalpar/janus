@@ -17,8 +17,17 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"os"
+
+	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
+	"github.com/aalpar/janus/internal/recover"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 func runRecover(args []string) int {
@@ -26,6 +35,84 @@ func runRecover(args []string) int {
 		fmt.Fprintf(os.Stderr, "Usage: janus recover <plan|apply> <transaction-name> [-n namespace]\n")
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "recover subcommand not yet implemented\n")
-	return 1
+
+	subcmd := args[0]
+	fs := flag.NewFlagSet("recover "+subcmd, flag.ExitOnError)
+	namespace := fs.String("n", "default", "namespace of the transaction")
+	fs.Parse(args[1:])
+
+	if fs.NArg() == 0 {
+		fmt.Fprintf(os.Stderr, "Error: transaction name required\n")
+		return 1
+	}
+	txnName := fs.Arg(0)
+
+	switch subcmd {
+	case "plan":
+		return runRecoverPlan(txnName, *namespace)
+	case "apply":
+		fmt.Fprintf(os.Stderr, "apply subcommand not yet implemented\n")
+		return 1
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown recover subcommand: %s\n", subcmd)
+		return 1
+	}
+}
+
+func runRecoverPlan(txnName, namespace string) int {
+	ctx := context.Background()
+	cl, err := buildClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
+		return 1
+	}
+
+	// Load rollback ConfigMap.
+	rbCMName := txnName + "-rollback"
+	rbCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: namespace}, rbCM); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot find rollback ConfigMap %q in namespace %q: %v\n", rbCMName, namespace, err)
+		return 1
+	}
+
+	// Optionally load Transaction CR for status.
+	var txnItems []recover.ItemStatusInfo
+	txn := &backupv1alpha1.Transaction{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: txnName, Namespace: namespace}, txn); err != nil {
+		if !apierrors.IsNotFound(err) {
+			fmt.Fprintf(os.Stderr, "Warning: cannot read Transaction %q: %v (proceeding from ConfigMap only)\n", txnName, err)
+		}
+	} else {
+		txnItems = make([]recover.ItemStatusInfo, len(txn.Status.Items))
+		for i, item := range txn.Status.Items {
+			txnItems[i] = recover.ItemStatusInfo{
+				Committed:  item.Committed,
+				RolledBack: item.RolledBack,
+			}
+		}
+	}
+
+	plan, err := recover.BuildPlan(rbCM, txnItems)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building plan: %v\n", err)
+		return 1
+	}
+
+	fmt.Print(recover.FormatPlan(plan))
+	if plan.HasPending() {
+		return 1
+	}
+	return 0
+}
+
+func buildClient() (client.Client, error) {
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("loading kubeconfig: %w", err)
+	}
+	cl, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("creating client: %w", err)
+	}
+	return cl, nil
 }
