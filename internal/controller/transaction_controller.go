@@ -476,7 +476,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		change := txn.Spec.Changes[i]
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 
-		if err := r.applyRollback(ctx, userClient, change, ns, rbCM); err != nil {
+		if err := r.applyRollback(ctx, userClient, change, ns, rbCM, txn.Name); err != nil {
 			var conflictErr *ErrRollbackConflict
 			if errors.As(err, &conflictErr) {
 				txmetrics.ItemOperations.WithLabelValues("rollback", "conflict").Inc()
@@ -646,7 +646,7 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Clien
 }
 
 // applyRollback reverses a committed change using the stored prior state.
-func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace string, rbCM *corev1.ConfigMap) error {
+func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace string, rbCM *corev1.ConfigMap, txnName string) error {
 	rbKey := rollback.Key(change.Target.Kind, namespace, change.Target.Name)
 
 	switch change.Type {
@@ -675,8 +675,39 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 		}
 		return nil
 
-	case backupv1alpha1.ChangeTypeUpdate, backupv1alpha1.ChangeTypePatch:
-		// Reverse = restore the previous state.
+	case backupv1alpha1.ChangeTypePatch:
+		// Reverse of Patch = SSA-apply prior values for the patched fields.
+		obj, _, err := loadRollbackState(rbCM, rbKey, namespace)
+		if err != nil {
+			return err
+		}
+
+		// Parse the forward patch content to know which fields were touched.
+		var contentMap map[string]any
+		if err := json.Unmarshal(change.Content.Raw, &contentMap); err != nil {
+			return &ResourceOpError{Op: "unmarshaling patch content for reverse", Err: err}
+		}
+
+		// Compute reverse: same field paths, prior values.
+		reversePatch := computeReversePatch(contentMap, obj.Object)
+
+		// SSA requires identity fields.
+		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
+		if err != nil {
+			return &ResourceOpError{Op: "parsing apiVersion for rollback patch", Ref: change.Target.APIVersion, Err: err}
+		}
+		patchObj := &unstructured.Unstructured{Object: reversePatch}
+		patchObj.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
+		})
+		patchObj.SetName(change.Target.Name)
+		patchObj.SetNamespace(namespace)
+
+		ac := client.ApplyConfigurationFromUnstructured(patchObj)
+		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
+
+	case backupv1alpha1.ChangeTypeUpdate:
+		// Reverse of Update = restore the full previous state.
 		obj, storedRV, err := loadRollbackState(rbCM, rbKey, namespace)
 		if err != nil {
 			return err

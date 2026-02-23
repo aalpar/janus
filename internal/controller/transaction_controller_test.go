@@ -1719,13 +1719,12 @@ var _ = Describe("Transaction Controller", func() {
 	})
 
 	Context("lease expiry and split-brain prevention", func() {
-		It("should detect external modification and fail instead of clobbering", func() {
-			// Previously this was a documented vulnerability: when TxnA fails and
-			// its leases expire, TxnB can acquire them and modify the resource.
-			// TxnA's auto-recovery rollback would blindly overwrite TxnB's changes.
-			//
-			// Now the rollback RV check detects the external modification and
-			// transitions to Failed, requiring manual intervention via janus recover.
+		It("should detect external modification on Update rollback and fail instead of clobbering", func() {
+			// When TxnA fails and its leases expire, TxnB can acquire them and
+			// modify the resource. TxnA's auto-recovery rollback must detect the
+			// external modification and transition to Failed rather than overwriting.
+			// This applies to Update change type; Patch uses reverse SSA which
+			// handles conflict at the field level via ForceOwnership.
 
 			// Create target resource.
 			origCM := &corev1.ConfigMap{
@@ -1736,6 +1735,15 @@ var _ = Describe("Transaction Controller", func() {
 				Data: map[string]string{"key": "original"},
 			}
 			Expect(k8sClient.Create(ctx, origCM)).To(Succeed())
+
+			// Build full Update content (not a partial Patch).
+			updateContent, err := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "staledata-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "txn-a-modified"},
+			})
+			Expect(err).NotTo(HaveOccurred())
 
 			// Create transaction with 2 items.
 			txn := &backupv1alpha1.Transaction{
@@ -1753,8 +1761,8 @@ var _ = Describe("Transaction Controller", func() {
 								Name:       "staledata-cm",
 								Namespace:  testNamespace,
 							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"txn-a-modified"}}`)},
+							Type:    backupv1alpha1.ChangeTypeUpdate,
+							Content: runtime.RawExtension{Raw: updateContent},
 						},
 						blockerChange("staledata-blocker"),
 					},
@@ -1768,7 +1776,7 @@ var _ = Describe("Transaction Controller", func() {
 
 			// Drive to commit item 0 (saves original state in rollback CM).
 			reconcileToPhase(reconciler, "staledata-txn", backupv1alpha1.TransactionPhaseCommitting)
-			_, err := reconciler.Reconcile(ctx, req("staledata-txn"))
+			_, err = reconciler.Reconcile(ctx, req("staledata-txn"))
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("staledata-txn"), txn)).To(Succeed())
@@ -2662,7 +2670,7 @@ var _ = Describe("Transaction Controller", func() {
 	})
 
 	Context("rollback conflict detection", func() {
-		It("should fail the transaction when a resource was modified externally during rollback", func() {
+		It("should fail the transaction when an Update resource was modified externally during rollback", func() {
 			// 1. Create target CM with original data.
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -2673,9 +2681,12 @@ var _ = Describe("Transaction Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
 
-			// 2. Create a 2-item transaction: Patch cm (item 0) + blocker Create (item 1).
-			patchContent, err := json.Marshal(map[string]any{
-				"data": map[string]any{"key": "patched"},
+			// 2. Create a 2-item transaction: Update cm (item 0) + blocker Create (item 1).
+			updateContent, err := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "rbconflict-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "updated"},
 			})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -2694,8 +2705,8 @@ var _ = Describe("Transaction Controller", func() {
 								Name:       "rbconflict-cm",
 								Namespace:  testNamespace,
 							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
+							Type:    backupv1alpha1.ChangeTypeUpdate,
+							Content: runtime.RawExtension{Raw: updateContent},
 						},
 						blockerChange("rbconflict-blocker"),
 					},
@@ -2763,6 +2774,82 @@ var _ = Describe("Transaction Controller", func() {
 
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("Patch rollback via reverse SSA patch", func() {
+		It("should restore only patched fields, preserving unrelated changes", func() {
+			// Create target with original data.
+			target := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "ssa-rb-cm", Namespace: testNamespace},
+				Data:       map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, target)).To(Succeed())
+
+			// Build a 2-item txn: Patch (item 0) + blocker Create (item 1).
+			// Item 1's lock renewal will fail, triggering rollback of item 0.
+			raw, err := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "ssa-rb-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "patched"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{Name: "ssa-rb-txn", Namespace: testNamespace},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Changes: []backupv1alpha1.ResourceChange{
+						{
+							Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "ssa-rb-cm"},
+							Type:    backupv1alpha1.ChangeTypePatch,
+							Content: runtime.RawExtension{Raw: raw},
+						},
+						blockerChange("ssa-rb-blocker"),
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			// Use real lock manager through prepare and first commit.
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			// Drive to Committing, then commit item 0 (Patch).
+			reconcileToPhase(reconciler, "ssa-rb-txn", backupv1alpha1.TransactionPhaseCommitting)
+			_, err = reconciler.Reconcile(ctx, req("ssa-rb-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("ssa-rb-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Verify the Patch was applied.
+			Expect(k8sClient.Get(ctx, nn("ssa-rb-cm"), target)).To(Succeed())
+			Expect(target.Data["key"]).To(Equal("patched"))
+
+			// Externally add an unrelated field (bumps RV).
+			target.Data["unrelated"] = "external-addition"
+			Expect(k8sClient.Update(ctx, target)).To(Succeed())
+
+			// Swap to failing lock manager: item 1's lock renewal fails → RollingBack.
+			reconciler.LockMgr = failingRenewLockMgr()
+			_, err = reconciler.Reconcile(ctx, req("ssa-rb-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("ssa-rb-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+
+			// Reconcile: RollingBack → reverse SSA patch rolls back item 0 → RolledBack.
+			reconcileToPhase(reconciler, "ssa-rb-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			// Verify: key restored to original, unrelated field preserved.
+			Expect(k8sClient.Get(ctx, nn("ssa-rb-cm"), target)).To(Succeed())
+			Expect(target.Data["key"]).To(Equal("original"))
+			Expect(target.Data["unrelated"]).To(Equal("external-addition"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, target)).To(Succeed())
 		})
 	})
 })
