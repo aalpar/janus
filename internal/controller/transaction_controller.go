@@ -225,10 +225,7 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 	log := logf.FromContext(ctx)
 	log.Info("handling deletion, releasing locks")
 
-	leaseRefs := r.collectLeaseRefs(txn)
-	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
-		log.Error(err, "best-effort lease release failed during deletion")
-	}
+	r.releaseAllLocks(ctx, txn)
 
 	controllerutil.RemoveFinalizer(txn, finalizerName)
 	if err := r.Update(ctx, txn); err != nil {
@@ -387,13 +384,7 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 
 	// All committed — release locks and clean up.
 	log.Info("all items committed, releasing locks")
-	leaseRefs := r.collectLeaseRefs(txn)
-	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
-		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
-		log.Error(err, "best-effort lease release failed after commit")
-	} else {
-		txmetrics.LockOperations.WithLabelValues("release", "success").Inc()
-	}
+	r.releaseAllLocks(ctx, txn)
 
 	// Delete rollback ConfigMap — no longer needed.
 	rbCM := &corev1.ConfigMap{}
@@ -455,13 +446,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 
 	// All rolled back — release locks, preserve rollback CM for forensics.
 	log.Info("rollback complete, releasing locks")
-	leaseRefs := r.collectLeaseRefs(txn)
-	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
-		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
-		log.Error(err, "best-effort lease release failed after rollback")
-	} else {
-		txmetrics.LockOperations.WithLabelValues("release", "success").Inc()
-	}
+	r.releaseAllLocks(ctx, txn)
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
@@ -617,15 +602,10 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 	case backupv1alpha1.ChangeTypeDelete:
 		// Reverse of Delete = re-Create from rollback state.
-		data, ok := rbCM.Data[rbKey]
-		if !ok {
-			return &RollbackDataError{Key: rbKey}
+		obj, err := loadRollbackState(rbCM, rbKey, namespace)
+		if err != nil {
+			return err
 		}
-		obj := &unstructured.Unstructured{}
-		if err := json.Unmarshal([]byte(data), &obj.Object); err != nil {
-			return &RollbackDataError{Key: rbKey, Err: err}
-		}
-		cleanForRestore(obj, namespace)
 		if err := cl.Create(ctx, obj); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				return nil // Already restored by a previous attempt.
@@ -636,15 +616,10 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 	case backupv1alpha1.ChangeTypeUpdate, backupv1alpha1.ChangeTypePatch:
 		// Reverse = restore the previous state.
-		data, ok := rbCM.Data[rbKey]
-		if !ok {
-			return &RollbackDataError{Key: rbKey}
+		obj, err := loadRollbackState(rbCM, rbKey, namespace)
+		if err != nil {
+			return err
 		}
-		obj := &unstructured.Unstructured{}
-		if err := json.Unmarshal([]byte(data), &obj.Object); err != nil {
-			return &RollbackDataError{Key: rbKey, Err: err}
-		}
-		cleanForRestore(obj, namespace)
 		// Fetch current resourceVersion for the update.
 		existing, err := r.getResource(ctx, cl, change.Target, namespace)
 		if err != nil {
@@ -729,6 +704,18 @@ func (r *TransactionReconciler) collectLeaseRefs(txn *backupv1alpha1.Transaction
 	return refs
 }
 
+// releaseAllLocks releases all leases for a transaction (best-effort) and records metrics.
+func (r *TransactionReconciler) releaseAllLocks(ctx context.Context, txn *backupv1alpha1.Transaction) {
+	log := logf.FromContext(ctx)
+	leaseRefs := r.collectLeaseRefs(txn)
+	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
+		log.Error(err, "best-effort lease release failed")
+	} else {
+		txmetrics.LockOperations.WithLabelValues("release", "success").Inc()
+	}
+}
+
 func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alpha1.Transaction, phase backupv1alpha1.TransactionPhase) (ctrl.Result, error) {
 	eventType := corev1.EventTypeNormal
 	if phase == backupv1alpha1.TransactionPhaseRollingBack || phase == backupv1alpha1.TransactionPhaseFailed {
@@ -753,34 +740,22 @@ func (r *TransactionReconciler) transition(ctx context.Context, txn *backupv1alp
 // conditionForPhase returns a status Condition for significant phase milestones, nil otherwise.
 // Failed is intentionally excluded — setFailed() handles it with a custom message.
 func conditionForPhase(phase backupv1alpha1.TransactionPhase) *metav1.Condition {
-	now := metav1.Now()
-	switch phase {
-	case backupv1alpha1.TransactionPhasePrepared:
-		return &metav1.Condition{
-			Type:               "Prepared",
-			Status:             metav1.ConditionTrue,
-			Reason:             "AllItemsPrepared",
-			Message:            "All items have been prepared",
-			LastTransitionTime: now,
-		}
-	case backupv1alpha1.TransactionPhaseCommitted:
-		return &metav1.Condition{
-			Type:               "Committed",
-			Status:             metav1.ConditionTrue,
-			Reason:             "AllItemsCommitted",
-			Message:            "All items have been committed",
-			LastTransitionTime: now,
-		}
-	case backupv1alpha1.TransactionPhaseRolledBack:
-		return &metav1.Condition{
-			Type:               "RolledBack",
-			Status:             metav1.ConditionTrue,
-			Reason:             "RollbackComplete",
-			Message:            "All committed items have been rolled back",
-			LastTransitionTime: now,
-		}
-	default:
+	type condDef struct{ Type, Reason, Message string }
+	conditions := map[backupv1alpha1.TransactionPhase]condDef{
+		backupv1alpha1.TransactionPhasePrepared:   {"Prepared", "AllItemsPrepared", "All items have been prepared"},
+		backupv1alpha1.TransactionPhaseCommitted:  {"Committed", "AllItemsCommitted", "All items have been committed"},
+		backupv1alpha1.TransactionPhaseRolledBack: {"RolledBack", "RollbackComplete", "All committed items have been rolled back"},
+	}
+	entry, ok := conditions[phase]
+	if !ok {
 		return nil
+	}
+	return &metav1.Condition{
+		Type:               entry.Type,
+		Status:             metav1.ConditionTrue,
+		Reason:             entry.Reason,
+		Message:            entry.Message,
+		LastTransitionTime: metav1.Now(),
 	}
 }
 
@@ -820,14 +795,7 @@ func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alph
 }
 
 func (r *TransactionReconciler) failAndReleaseLocks(ctx context.Context, txn *backupv1alpha1.Transaction, message string) error {
-	log := logf.FromContext(ctx)
-	leaseRefs := r.collectLeaseRefs(txn)
-	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
-		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
-		log.Error(err, "best-effort lease release failed during failure handling")
-	} else {
-		txmetrics.LockOperations.WithLabelValues("release", "success").Inc()
-	}
+	r.releaseAllLocks(ctx, txn)
 	return r.setFailed(ctx, txn, message)
 }
 
@@ -859,6 +827,20 @@ func rollbackKey(ref backupv1alpha1.ResourceRef, namespace string) string {
 // be re-created or updated in the cluster. OwnerReferences and finalizers are
 // preserved — they were part of the original resource state and are needed to
 // maintain GC chains and external controller contracts.
+// loadRollbackState retrieves and deserializes a resource's prior state from the rollback ConfigMap.
+func loadRollbackState(rbCM *corev1.ConfigMap, rbKey, namespace string) (*unstructured.Unstructured, error) {
+	data, ok := rbCM.Data[rbKey]
+	if !ok {
+		return nil, &RollbackDataError{Key: rbKey}
+	}
+	obj := &unstructured.Unstructured{}
+	if err := json.Unmarshal([]byte(data), &obj.Object); err != nil {
+		return nil, &RollbackDataError{Key: rbKey, Err: err}
+	}
+	cleanForRestore(obj, namespace)
+	return obj, nil
+}
+
 func cleanForRestore(obj *unstructured.Unstructured, targetNS string) {
 	obj.SetResourceVersion("")
 	obj.SetUID("")
