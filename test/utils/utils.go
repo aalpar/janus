@@ -157,7 +157,7 @@ func LoadImageToK0s(name string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("sudo", "k0s", "ctr", "images", "import", "-")
+	cmd := exec.Command("sudo", "/usr/local/bin/k0s", "ctr", "images", "import", "-")
 	cmd.Stdin = reader
 	_, err = Run(cmd)
 	return err
