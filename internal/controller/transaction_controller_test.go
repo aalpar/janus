@@ -2914,3 +2914,87 @@ var _ = Describe("cleanForRestore", func() {
 		Expect(obj.GetNamespace()).To(Equal("original"))
 	})
 })
+
+// --- computeReversePatch unit tests ---
+
+var _ = Describe("computeReversePatch", func() {
+	It("should replace leaf values with prior state values", func() {
+		forwardPatch := map[string]any{
+			"data": map[string]any{
+				"version": "2.0",
+			},
+		}
+		priorState := map[string]any{
+			"data": map[string]any{
+				"version": "1.0",
+				"other":   "untouched",
+			},
+		}
+		result := computeReversePatch(forwardPatch, priorState)
+		Expect(result).To(HaveKey("data"))
+		data := result["data"].(map[string]any)
+		Expect(data["version"]).To(Equal("1.0"))
+		Expect(data).NotTo(HaveKey("other"), "untouched fields should not appear")
+	})
+
+	It("should omit fields that did not exist in prior state (added by patch)", func() {
+		forwardPatch := map[string]any{
+			"data": map[string]any{
+				"existing": "new-val",
+				"added":    "brand-new",
+			},
+		}
+		priorState := map[string]any{
+			"data": map[string]any{
+				"existing": "old-val",
+			},
+		}
+		result := computeReversePatch(forwardPatch, priorState)
+		data := result["data"].(map[string]any)
+		Expect(data["existing"]).To(Equal("old-val"))
+		Expect(data).NotTo(HaveKey("added"))
+	})
+
+	It("should handle nested maps recursively", func() {
+		forwardPatch := map[string]any{
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"containers": []any{
+							map[string]any{"name": "web", "image": "app:v2"},
+						},
+					},
+				},
+			},
+		}
+		priorState := map[string]any{
+			"spec": map[string]any{
+				"template": map[string]any{
+					"spec": map[string]any{
+						"containers": []any{
+							map[string]any{"name": "web", "image": "app:v1"},
+						},
+					},
+				},
+			},
+		}
+		result := computeReversePatch(forwardPatch, priorState)
+		containers := result["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"]
+		Expect(containers).To(Equal(priorState["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"]))
+	})
+
+	It("should return empty map when forward patch touches no prior fields", func() {
+		forwardPatch := map[string]any{
+			"data": map[string]any{
+				"newKey": "newVal",
+			},
+		}
+		priorState := map[string]any{
+			"data": map[string]any{
+				"existingKey": "existingVal",
+			},
+		}
+		result := computeReversePatch(forwardPatch, priorState)
+		Expect(result).To(BeEmpty())
+	})
+})

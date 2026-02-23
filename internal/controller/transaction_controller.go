@@ -971,6 +971,32 @@ func cleanForRestore(obj *unstructured.Unstructured, targetNS string) {
 	}
 }
 
+// computeReversePatch takes a forward patch and the full prior state, and
+// returns a partial object that restores patched fields to their prior values.
+// Fields present in the forward patch but absent from the prior state are
+// omitted (they were added by the patch and should be removed on rollback).
+// Non-map leaf values (including slices) are treated as atomic replacements.
+func computeReversePatch(forwardPatch, priorState map[string]any) map[string]any {
+	result := make(map[string]any)
+	for key, newVal := range forwardPatch {
+		priorVal, exists := priorState[key]
+		if !exists {
+			continue // Field was added by patch; omit from reverse.
+		}
+		newMap, newIsMap := newVal.(map[string]any)
+		priorMap, priorIsMap := priorVal.(map[string]any)
+		if newIsMap && priorIsMap {
+			sub := computeReversePatch(newMap, priorMap)
+			if len(sub) > 0 {
+				result[key] = sub
+			}
+		} else {
+			result[key] = priorVal
+		}
+	}
+	return result
+}
+
 // recordPhaseChange updates phase-transition counter and active-transactions gauge.
 func recordPhaseChange(from, to backupv1alpha1.TransactionPhase) {
 	oldPhase := string(from)
