@@ -269,6 +269,27 @@ func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1
 		},
 		Data: map[string]string{},
 	}
+
+	// Populate _meta so the CLI can operate without the Transaction CR.
+	metaChanges := make([]rollback.MetaChange, len(txn.Spec.Changes))
+	for i, ch := range txn.Spec.Changes {
+		ns := r.resolveNamespace(ch.Target, txn.Namespace)
+		metaChanges[i] = rollback.MetaChange{
+			Index:       i,
+			Target:      rollback.MetaTarget{APIVersion: ch.Target.APIVersion, Kind: ch.Target.Kind, Name: ch.Target.Name, Namespace: ns},
+			ChangeType:  string(ch.Type),
+			RollbackKey: rollback.Key(ch.Target.Kind, ns, ch.Target.Name),
+		}
+	}
+	meta := rollback.Meta{
+		Version:              1,
+		TransactionName:      txn.Name,
+		TransactionNamespace: txn.Namespace,
+		Changes:              metaChanges,
+	}
+	metaJSON, _ := json.Marshal(meta)
+	cm.Data[rollback.MetaKey] = string(metaJSON)
+
 	if err := r.Create(ctx, cm); err != nil && !apierrors.IsAlreadyExists(err) {
 		return ctrl.Result{}, r.setFailed(ctx, txn, fmt.Sprintf("creating rollback ConfigMap: %v", err))
 	}

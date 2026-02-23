@@ -39,6 +39,7 @@ import (
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
 	"github.com/aalpar/janus/internal/lock"
 	txmetrics "github.com/aalpar/janus/internal/metrics"
+	"github.com/aalpar/janus/internal/rollback"
 )
 
 const (
@@ -2621,6 +2622,45 @@ var _ = Describe("Transaction Controller", func() {
 			cm := &corev1.ConfigMap{}
 			_ = k8sClient.Get(ctx, nn("lock-timeout-cm"), cm)
 			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, cm))
+		})
+	})
+
+	Context("rollback ConfigMap _meta key", func() {
+		It("should contain correct transaction metadata after reaching Prepared", func() {
+			txn := minimalTxn("meta-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			reconcileToPhase(reconciler, "meta-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// Read the rollback ConfigMap.
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, nn("meta-txn"+rollbackCMSuffix), cm)).To(Succeed())
+
+			// Verify _meta key exists.
+			raw, ok := cm.Data[rollback.MetaKey]
+			Expect(ok).To(BeTrue(), "_meta key should be present in rollback ConfigMap")
+
+			// Unmarshal and verify contents.
+			var meta rollback.Meta
+			Expect(json.Unmarshal([]byte(raw), &meta)).To(Succeed())
+			Expect(meta.Version).To(Equal(1))
+			Expect(meta.TransactionName).To(Equal("meta-txn"))
+			Expect(meta.TransactionNamespace).To(Equal(testNamespace))
+			Expect(meta.Changes).To(HaveLen(1))
+
+			ch := meta.Changes[0]
+			Expect(ch.Index).To(Equal(0))
+			Expect(ch.ChangeType).To(Equal(string(backupv1alpha1.ChangeTypeCreate)))
+			Expect(ch.Target.APIVersion).To(Equal("v1"))
+			Expect(ch.Target.Kind).To(Equal("ConfigMap"))
+			Expect(ch.Target.Name).To(Equal("meta-txn-cm"))
+			Expect(ch.Target.Namespace).To(Equal(testNamespace))
+			Expect(ch.RollbackKey).To(Equal(rollback.Key("ConfigMap", testNamespace, "meta-txn-cm")))
+
+			// Clean up created ConfigMap.
+			created := &corev1.ConfigMap{}
+			_ = k8sClient.Get(ctx, nn("meta-txn-cm"), created)
+			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, created))
 		})
 	})
 })
