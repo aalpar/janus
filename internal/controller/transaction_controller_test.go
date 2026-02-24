@@ -3225,11 +3225,14 @@ var _ = Describe("Transaction Controller", func() {
 
 	Context("continue-past-conflicts rollback", func() {
 		It("should skip conflicted Update items and still roll back Patch items", func() {
-			// 3-item txn: Patch (0) + Update (1) + blocker Create (2).
+			// 3-item txn: Patch (order 0) + Update (order 1) + blocker Create (order 2).
 			// Reverse iteration hits Update (1) first → conflict → must skip.
 			// Then Patch (0) → reverse SSA → success. Final: Failed.
 			// This ordering is critical: with stop-on-first, item 0 would never
 			// get rolled back because the conflict on item 1 stops everything.
+			//
+			// The blocker must have order 2 (not 1) so it sorts after the Update.
+			// With order+name sorting, same-order items sort alphabetically by name.
 
 			for _, name := range []string{"cpc-patch-cm", "cpc-upd-cm"} {
 				cm := &corev1.ConfigMap{
@@ -3249,6 +3252,12 @@ var _ = Describe("Transaction Controller", func() {
 				"apiVersion": "v1", "kind": "ConfigMap",
 				"metadata": map[string]any{"name": "cpc-upd-cm", "namespace": testNamespace},
 				"data":     map[string]any{"key": "updated"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			blockerContent, err := json.Marshal(map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "cpc-blocker", "namespace": testNamespace},
+				"data":     map[string]any{"k": "v"},
 			})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -3273,7 +3282,17 @@ var _ = Describe("Transaction Controller", func() {
 				Order:   1,
 			}, txn.UID)
 			Expect(k8sClient.Create(ctx, rc1)).To(Succeed())
-			blocker := blockerChange("cpc-txn", "cpc-blocker", txn.UID)
+			blocker := createChange("cpc-txn", "cpc-blocker-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "cpc-blocker",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: blockerContent},
+				Order:   2,
+			}, txn.UID)
 			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			// Real lock manager for prepare and commits.
