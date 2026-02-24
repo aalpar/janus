@@ -26,7 +26,7 @@ type Envelope struct {
 
 // Meta is stored under MetaKey and describes the transaction as a whole.
 type Meta struct {
-	// Version of the rollback format. Currently 1.
+	// Version of the rollback format. Currently 2.
 	Version int `json:"version"`
 	// TransactionName is the name of the owning Transaction.
 	TransactionName string `json:"transactionName"`
@@ -38,8 +38,8 @@ type Meta struct {
 
 // MetaChange records one transaction item's rollback location.
 type MetaChange struct {
-	// Index of this item within the Transaction spec.
-	Index int `json:"index"`
+	// Name of the ResourceChange CR.
+	Name string `json:"name"`
 	// Target identifies the resource being changed.
 	Target MetaTarget `json:"target"`
 	// ChangeType that was applied (Create, Patch, Delete, Update).

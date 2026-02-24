@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -128,6 +129,11 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				return ctrl.Result{}, err
 			}
 		}
+		return ctrl.Result{}, nil
+	}
+
+	// Ignore unsealed transactions that haven't started processing.
+	if !txn.Spec.Sealed && (txn.Status.Phase == "" || txn.Status.Phase == backupv1alpha1.TransactionPhasePending) {
 		return ctrl.Result{}, nil
 	}
 
@@ -241,16 +247,28 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 // handlePending initializes the transaction status and creates the rollback ConfigMap.
 func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	log.Info("initializing transaction", "changes", len(txn.Spec.Changes))
-	r.event(txn, corev1.EventTypeNormal, "Initializing", "starting transaction with %d changes", len(txn.Spec.Changes))
+
+	changes, err := r.listChanges(ctx, txn)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing ResourceChanges: %w", err)
+	}
+	if len(changes) == 0 {
+		return ctrl.Result{}, r.setFailed(ctx, txn, "no ResourceChange CRs found for this transaction")
+	}
+
+	log.Info("initializing transaction", "changes", len(changes))
+	r.event(txn, corev1.EventTypeNormal, "Initializing", "starting transaction with %d changes", len(changes))
 
 	wasNew := txn.Status.StartedAt == nil
 	now := metav1.Now()
 	txn.Status.StartedAt = &now
-	txn.Status.Items = make([]backupv1alpha1.ItemStatus, len(txn.Spec.Changes))
+	txn.Status.Items = make([]backupv1alpha1.ItemStatus, len(changes))
+	for i, rc := range changes {
+		txn.Status.Items[i] = backupv1alpha1.ItemStatus{Name: rc.Name}
+	}
 	txn.Status.RollbackRef = txn.Name + rollbackCMSuffix
 	if wasNew {
-		txmetrics.ItemCount.Observe(float64(len(txn.Spec.Changes)))
+		txmetrics.ItemCount.Observe(float64(len(changes)))
 	}
 
 	// Create the rollback ConfigMap.
@@ -273,18 +291,18 @@ func (r *TransactionReconciler) handlePending(ctx context.Context, txn *backupv1
 	}
 
 	// Populate _meta so the CLI can operate without the Transaction CR.
-	metaChanges := make([]rollback.MetaChange, len(txn.Spec.Changes))
-	for i, ch := range txn.Spec.Changes {
-		ns := r.resolveNamespace(ch.Target, txn.Namespace)
+	metaChanges := make([]rollback.MetaChange, len(changes))
+	for i, rc := range changes {
+		ns := r.resolveNamespace(rc.Spec.Target, txn.Namespace)
 		metaChanges[i] = rollback.MetaChange{
-			Index:       i,
-			Target:      rollback.MetaTarget{APIVersion: ch.Target.APIVersion, Kind: ch.Target.Kind, Name: ch.Target.Name, Namespace: ns},
-			ChangeType:  string(ch.Type),
-			RollbackKey: rollback.Key(ch.Target.Kind, ns, ch.Target.Name),
+			Name:        rc.Name,
+			Target:      rollback.MetaTarget{APIVersion: rc.Spec.Target.APIVersion, Kind: rc.Spec.Target.Kind, Name: rc.Spec.Target.Name, Namespace: ns},
+			ChangeType:  string(rc.Spec.Type),
+			RollbackKey: rollback.Key(rc.Spec.Target.Kind, ns, rc.Spec.Target.Name),
 		}
 	}
 	meta := rollback.Meta{
-		Version:              1,
+		Version:              2,
 		TransactionName:      txn.Name,
 		TransactionNamespace: txn.Namespace,
 		Changes:              metaChanges,
@@ -304,11 +322,21 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 	log := logf.FromContext(ctx)
 	timeout := r.lockTimeout(txn)
 
-	for i, change := range txn.Spec.Changes {
-		if txn.Status.Items[i].Prepared {
+	changes, err := r.listChanges(ctx, txn)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing ResourceChanges: %w", err)
+	}
+
+	for _, rc := range changes {
+		item := findItemStatus(txn.Status.Items, rc.Name)
+		if item == nil {
+			return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("no status entry for ResourceChange %q", rc.Name))
+		}
+		if item.Prepared {
 			continue
 		}
 
+		change := rc.Spec
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 		key := lock.ResourceKey{Namespace: ns, Kind: change.Target.Kind, Name: change.Target.Name}
 
@@ -316,26 +344,26 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 		leaseName, err := r.LockMgr.Acquire(ctx, key, txn.Name, timeout)
 		if err != nil {
 			txmetrics.LockOperations.WithLabelValues("acquire", "error").Inc()
-			log.Error(err, "lock acquisition failed", "item", i, "resource", key)
-			r.event(txn, corev1.EventTypeWarning, "LockFailed", "item %d: lock acquisition failed for %s/%s: %v", i, change.Target.Kind, change.Target.Name, err)
+			log.Error(err, "lock acquisition failed", "resourcechange", rc.Name, "resource", key)
+			r.event(txn, corev1.EventTypeWarning, "LockFailed", "%s: lock acquisition failed for %s/%s: %v", rc.Name, change.Target.Kind, change.Target.Name, err)
 			txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
-			return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d lock failed: %v", i, err))
+			return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s lock failed: %v", rc.Name, err))
 		}
 		txmetrics.LockOperations.WithLabelValues("acquire", "success").Inc()
-		txn.Status.Items[i].LockLease = leaseName
-		txn.Status.Items[i].LeaseNamespace = ns
+		item.LockLease = leaseName
+		item.LeaseNamespace = ns
 
 		// Read current state and store in rollback ConfigMap.
 		if change.Type != backupv1alpha1.ChangeTypeCreate {
 			obj, err := r.getResource(ctx, userClient, change.Target, ns)
 			if err != nil {
 				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: reading current state: %v", i, err))
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: reading current state: %v", rc.Name, err))
 			}
-			txn.Status.Items[i].ResourceVersion = obj.GetResourceVersion()
+			item.ResourceVersion = obj.GetResourceVersion()
 			if err := r.saveRollbackState(ctx, txn, change, obj); err != nil {
 				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: saving rollback state: %v", i, err))
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving rollback state: %v", rc.Name, err))
 			}
 		} else {
 			// Create changes have no prior state, but store an envelope so the
@@ -343,25 +371,25 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 			env := rollback.Envelope{ChangeType: string(change.Type)}
 			envData, err := json.Marshal(env)
 			if err != nil {
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: serializing create envelope: %v", i, err))
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: serializing create envelope: %v", rc.Name, err))
 			}
 			cm := &corev1.ConfigMap{}
 			if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); err != nil {
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: fetching rollback ConfigMap: %v", i, err))
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: fetching rollback ConfigMap: %v", rc.Name, err))
 			}
 			if cm.Data == nil {
 				cm.Data = make(map[string]string)
 			}
-			key := rollback.Key(change.Target.Kind, ns, change.Target.Name)
-			cm.Data[key] = string(envData)
+			rbKey := rollback.Key(change.Target.Kind, ns, change.Target.Name)
+			cm.Data[rbKey] = string(envData)
 			if err := r.Update(ctx, cm); err != nil {
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("item %d: saving create envelope: %v", i, err))
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving create envelope: %v", rc.Name, err))
 			}
 		}
 
 		txmetrics.ItemOperations.WithLabelValues("prepare", "success").Inc()
-		txn.Status.Items[i].Prepared = true
-		log.Info("item prepared", "item", i, "kind", change.Target.Kind, "name", change.Target.Name)
+		item.Prepared = true
+		log.Info("item prepared", "resourcechange", rc.Name, "kind", change.Target.Kind, "name", change.Target.Name)
 
 		// Persist progress and requeue — one item per reconcile cycle.
 		return r.updateStatusAndRequeue(ctx, txn)
@@ -375,18 +403,29 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backupv1alpha1.Transaction, userClient client.Client) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	for i, change := range txn.Spec.Changes {
-		if txn.Status.Items[i].Committed {
+	changes, err := r.listChanges(ctx, txn)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing ResourceChanges: %w", err)
+	}
+
+	for _, rc := range changes {
+		item := findItemStatus(txn.Status.Items, rc.Name)
+		if item == nil {
+			return ctrl.Result{}, r.setFailed(ctx, txn, fmt.Sprintf("no status entry for ResourceChange %q", rc.Name))
+		}
+		if item.Committed {
 			continue
 		}
 
+		change := rc.Spec
+
 		// Renew the lock to prevent expiry during long commit phases.
 		timeout := r.lockTimeout(txn)
-		leaseRef := lock.LeaseRef{Name: txn.Status.Items[i].LockLease, Namespace: txn.Status.Items[i].LeaseNamespace}
+		leaseRef := lock.LeaseRef{Name: item.LockLease, Namespace: item.LeaseNamespace}
 		if err := r.LockMgr.Renew(ctx, leaseRef, txn.Name, timeout); err != nil {
 			txmetrics.LockOperations.WithLabelValues("renew", "error").Inc()
-			log.Error(err, "lock renewal failed, initiating rollback", "item", i)
-			r.event(txn, corev1.EventTypeWarning, "LockRenewalFailed", "item %d: lock renewal failed, initiating rollback: %v", i, err)
+			log.Error(err, "lock renewal failed, initiating rollback", "resourcechange", rc.Name)
+			r.event(txn, corev1.EventTypeWarning, "LockRenewalFailed", "%s: lock renewal failed, initiating rollback: %v", rc.Name, err)
 			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 		}
 		txmetrics.LockOperations.WithLabelValues("renew", "success").Inc()
@@ -394,44 +433,44 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 
 		// Check for external modifications since prepare.
-		if err := r.checkConflict(ctx, userClient, change, ns, txn.Status.Items[i].ResourceVersion); err != nil {
+		if err := r.checkConflict(ctx, userClient, change, ns, item.ResourceVersion); err != nil {
 			txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
-			log.Error(err, "conflict detected, failing transaction", "item", i)
+			log.Error(err, "conflict detected, failing transaction", "resourcechange", rc.Name)
 			r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
-				"item %d: %s/%s was modified externally since prepare", i, change.Target.Kind, change.Target.Name)
+				"%s: %s/%s was modified externally since prepare", rc.Name, change.Target.Kind, change.Target.Name)
 			return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
 		}
 
-		if err := r.applyChange(ctx, userClient, change, ns, txn.Name, txn.Status.Items[i].ResourceVersion); err != nil {
+		if err := r.applyChange(ctx, userClient, change, ns, txn.Name, item.ResourceVersion); err != nil {
 			var conflictErr *ErrConflictDetected
 			if errors.As(err, &conflictErr) {
 				txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
-				log.Error(err, "conflict detected during apply, failing transaction", "item", i)
+				log.Error(err, "conflict detected during apply, failing transaction", "resourcechange", rc.Name)
 				r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
-					"item %d: %s/%s was modified externally", i, change.Target.Kind, change.Target.Name)
+					"%s: %s/%s was modified externally", rc.Name, change.Target.Kind, change.Target.Name)
 				return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
 			}
 			txmetrics.ItemOperations.WithLabelValues("commit", "error").Inc()
-			txn.Status.Items[i].Error = err.Error()
-			log.Error(err, "commit failed, initiating rollback", "item", i)
-			r.event(txn, corev1.EventTypeWarning, "CommitFailed", "item %d: %s %s/%s failed: %v", i, change.Type, change.Target.Kind, change.Target.Name, err)
+			item.Error = err.Error()
+			log.Error(err, "commit failed, initiating rollback", "resourcechange", rc.Name)
+			r.event(txn, corev1.EventTypeWarning, "CommitFailed", "%s: %s %s/%s failed: %v", rc.Name, change.Type, change.Target.Kind, change.Target.Name, err)
 			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 		}
 
 		txmetrics.ItemOperations.WithLabelValues("commit", "success").Inc()
-		txn.Status.Items[i].Committed = true
+		item.Committed = true
 
 		// Update rollback envelope with post-commit RV so the rollback conflict
 		// check compares against the RV Janus wrote, not the pre-commit RV.
 		if change.Type == backupv1alpha1.ChangeTypeUpdate || change.Type == backupv1alpha1.ChangeTypePatch {
 			if err := r.updateRollbackRV(ctx, txn, change, ns, userClient); err != nil {
-				log.Error(err, "failed to update rollback RV after commit", "item", i)
+				log.Error(err, "failed to update rollback RV after commit", "resourcechange", rc.Name)
 				// Non-fatal: worst case rollback will detect a false conflict.
 			}
 		}
 
-		log.Info("item committed", "item", i, "type", change.Type, "kind", change.Target.Kind, "name", change.Target.Name)
-		r.event(txn, corev1.EventTypeNormal, "ItemCommitted", "item %d: %s %s/%s committed", i, change.Type, change.Target.Kind, change.Target.Name)
+		log.Info("item committed", "resourcechange", rc.Name, "type", change.Type, "kind", change.Target.Kind, "name", change.Target.Name)
+		r.event(txn, corev1.EventTypeNormal, "ItemCommitted", "%s: %s %s/%s committed", rc.Name, change.Type, change.Target.Kind, change.Target.Name)
 
 		return r.updateStatusAndRequeue(ctx, txn)
 	}
@@ -468,9 +507,18 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		return ctrl.Result{}, r.setFailed(ctx, txn, fmt.Sprintf("rollback ConfigMap missing: %v", err))
 	}
 
+	changes, err := r.listChanges(ctx, txn)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing ResourceChanges: %w", err)
+	}
+
 	// Iterate in reverse — rollback committed, not-yet-rolled-back items.
-	for i := len(txn.Spec.Changes) - 1; i >= 0; i-- {
-		item := &txn.Status.Items[i]
+	for i := len(changes) - 1; i >= 0; i-- {
+		rc := changes[i]
+		item := findItemStatus(txn.Status.Items, rc.Name)
+		if item == nil {
+			continue
+		}
 		if !item.Committed || item.RolledBack {
 			continue
 		}
@@ -479,7 +527,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 			continue
 		}
 
-		change := txn.Spec.Changes[i]
+		change := rc.Spec
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 
 		if err := r.applyRollback(ctx, userClient, change, ns, rbCM, txn.Name); err != nil {
@@ -488,22 +536,22 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 				// Conflict: record on item, skip, continue to next item.
 				txmetrics.ItemOperations.WithLabelValues("rollback", "conflict").Inc()
 				item.Error = err.Error()
-				log.Info("rollback conflict detected, skipping item", "item", i,
+				log.Info("rollback conflict detected, skipping item", "resourcechange", rc.Name,
 					"kind", change.Target.Kind, "name", change.Target.Name)
 				r.event(txn, corev1.EventTypeWarning, "RollbackConflict",
-					"item %d: %s — manual intervention required via janus recover", i, err)
+					"%s: %s — manual intervention required via janus recover", rc.Name, err)
 				// Requeue to continue with remaining items.
 				return r.updateStatusAndRequeue(ctx, txn)
 			}
 			// Non-conflict error: transient, retry.
 			txmetrics.ItemOperations.WithLabelValues("rollback", "error").Inc()
 			item.Error = fmt.Sprintf("rollback failed: %v", err)
-			log.Error(err, "rollback failed for item, will retry", "item", i)
+			log.Error(err, "rollback failed for item, will retry", "resourcechange", rc.Name)
 			r.event(txn, corev1.EventTypeWarning, "RollbackFailed",
-				"item %d: rollback failed for %s/%s, will retry: %v",
-				i, change.Target.Kind, change.Target.Name, err)
+				"%s: rollback failed for %s/%s, will retry: %v",
+				rc.Name, change.Target.Kind, change.Target.Name, err)
 			if statusErr := r.Status().Update(ctx, txn); statusErr != nil {
-				log.Error(statusErr, "failed to persist rollback error on item status", "item", i)
+				log.Error(statusErr, "failed to persist rollback error on item status", "resourcechange", rc.Name)
 			}
 			return ctrl.Result{}, err
 		}
@@ -511,8 +559,8 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 		txmetrics.ItemOperations.WithLabelValues("rollback", "success").Inc()
 		item.Error = "" // clear stale error from a previous failed attempt
 		item.RolledBack = true
-		log.Info("item rolled back", "item", i, "kind", change.Target.Kind, "name", change.Target.Name)
-		r.event(txn, corev1.EventTypeNormal, "ItemRolledBack", "item %d: %s/%s rolled back", i, change.Target.Kind, change.Target.Name)
+		log.Info("item rolled back", "resourcechange", rc.Name, "kind", change.Target.Kind, "name", change.Target.Name)
+		r.event(txn, corev1.EventTypeNormal, "ItemRolledBack", "%s: %s/%s rolled back", rc.Name, change.Target.Kind, change.Target.Name)
 
 		return r.updateStatusAndRequeue(ctx, txn)
 	}
@@ -553,7 +601,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 
 // checkConflict verifies that a target resource has not been modified since prepare.
 func (r *TransactionReconciler) checkConflict(ctx context.Context, cl client.Client,
-	change backupv1alpha1.ResourceChange, ns string, expectedRV string) error {
+	change backupv1alpha1.ResourceChangeSpec, ns string, expectedRV string) error {
 
 	if change.Type == backupv1alpha1.ChangeTypeCreate || expectedRV == "" {
 		return nil
@@ -597,12 +645,12 @@ func (r *TransactionReconciler) getResource(ctx context.Context, cl client.Clien
 	return obj, nil
 }
 
-// applyChange dispatches the appropriate mutation for a ResourceChange.
+// applyChange dispatches the appropriate mutation for a ResourceChangeSpec.
 // txnName is used as the field manager identity for server-side apply patches.
 // storedRV is the resourceVersion captured during prepare; it enables native
 // Kubernetes conflict detection for Update (optimistic concurrency) and Delete
 // (precondition) operations.
-func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace, txnName, storedRV string) error {
+func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChangeSpec, namespace, txnName, storedRV string) error {
 	switch change.Type {
 	case backupv1alpha1.ChangeTypeCreate:
 		obj, err := r.unmarshalContent(change.Content, change.Target)
@@ -680,7 +728,7 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Clien
 }
 
 // applyRollback reverses a committed change using the stored prior state.
-func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChange, namespace string, rbCM *corev1.ConfigMap, txnName string) error {
+func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChangeSpec, namespace string, rbCM *corev1.ConfigMap, txnName string) error {
 	rbKey := rollback.Key(change.Target.Kind, namespace, change.Target.Name)
 
 	switch change.Type {
@@ -781,7 +829,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 // and updates the rollback envelope so the RV reflects the post-commit state.
 // This lets the rollback conflict check distinguish Janus's own writes from
 // external modifications.
-func (r *TransactionReconciler) updateRollbackRV(ctx context.Context, txn *backupv1alpha1.Transaction, change backupv1alpha1.ResourceChange, namespace string, cl client.Client) error {
+func (r *TransactionReconciler) updateRollbackRV(ctx context.Context, txn *backupv1alpha1.Transaction, change backupv1alpha1.ResourceChangeSpec, namespace string, cl client.Client) error {
 	obj, err := r.getResource(ctx, cl, change.Target, namespace)
 	if err != nil {
 		return err
@@ -822,7 +870,7 @@ func (r *TransactionReconciler) unmarshalContent(raw runtime.RawExtension, ref b
 	return obj, nil
 }
 
-func (r *TransactionReconciler) saveRollbackState(ctx context.Context, txn *backupv1alpha1.Transaction, change backupv1alpha1.ResourceChange, obj *unstructured.Unstructured) error {
+func (r *TransactionReconciler) saveRollbackState(ctx context.Context, txn *backupv1alpha1.Transaction, change backupv1alpha1.ResourceChangeSpec, obj *unstructured.Unstructured) error {
 	ns := r.resolveNamespace(change.Target, txn.Namespace)
 	key := rollback.Key(change.Target.Kind, ns, change.Target.Name)
 
@@ -995,6 +1043,45 @@ func (r *TransactionReconciler) hasUnrolledCommits(txn *backupv1alpha1.Transacti
 	return false
 }
 
+// listChanges returns the ResourceChanges owned by the Transaction, sorted by
+// (order, name) for deterministic processing.
+func (r *TransactionReconciler) listChanges(ctx context.Context, txn *backupv1alpha1.Transaction) ([]backupv1alpha1.ResourceChange, error) {
+	var list backupv1alpha1.ResourceChangeList
+	if err := r.List(ctx, &list, client.InNamespace(txn.Namespace)); err != nil {
+		return nil, err
+	}
+
+	// Filter to only those owned by this Transaction.
+	var owned []backupv1alpha1.ResourceChange
+	for _, rc := range list.Items {
+		for _, ref := range rc.OwnerReferences {
+			if ref.UID == txn.UID {
+				owned = append(owned, rc)
+				break
+			}
+		}
+	}
+
+	// Sort by (order, name).
+	sort.Slice(owned, func(i, j int) bool {
+		if owned[i].Spec.Order != owned[j].Spec.Order {
+			return owned[i].Spec.Order < owned[j].Spec.Order
+		}
+		return owned[i].Name < owned[j].Name
+	})
+	return owned, nil
+}
+
+// findItemStatus returns the ItemStatus for the given ResourceChange name, or nil.
+func findItemStatus(items []backupv1alpha1.ItemStatus, name string) *backupv1alpha1.ItemStatus {
+	for i := range items {
+		if items[i].Name == name {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
 // loadRollbackState retrieves and deserializes a resource's prior state from the rollback ConfigMap.
 // It returns the prior-state object (nil for Create envelopes), the stored resourceVersion, and any error.
 func loadRollbackState(rbCM *corev1.ConfigMap, rbKey, namespace string) (*unstructured.Unstructured, string, error) {
@@ -1075,6 +1162,7 @@ func isTerminalPhase(p backupv1alpha1.TransactionPhase) bool {
 func (r *TransactionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&backupv1alpha1.Transaction{}).
+		Owns(&backupv1alpha1.ResourceChange{}).
 		Named("transaction").
 		Complete(r)
 }
