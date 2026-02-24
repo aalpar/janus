@@ -50,7 +50,7 @@ const (
 	defaultTimeout            = 5 * time.Minute
 	defaultTransactionTimeout = 30 * time.Minute
 	rollbackCMSuffix          = "-rollback"
-	finalizerName             = "backup.janus.io/lease-cleanup"
+	finalizerName             = "tx.janus.io/lease-cleanup"
 )
 
 // cachedClient holds a lazily-initialized impersonating client.
@@ -75,9 +75,9 @@ type TransactionReconciler struct {
 	impersonatedClients sync.Map // → *cachedClient
 }
 
-// +kubebuilder:rbac:groups=backup.janus.io,resources=transactions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=backup.janus.io,resources=transactions/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=backup.janus.io,resources=transactions/finalizers,verbs=update
+// +kubebuilder:rbac:groups=tx.janus.io,resources=transactions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tx.janus.io,resources=transactions/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=tx.janus.io,resources=transactions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch

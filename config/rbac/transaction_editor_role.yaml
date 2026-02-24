@@ -8,7 +8,7 @@ metadata:
   name: transaction-editor-role
 rules:
 - apiGroups:
-  - backup.janus.io
+  - tx.janus.io
   resources:
   - transactions
   verbs:
@@ -20,7 +20,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - backup.janus.io
+  - tx.janus.io
   resources:
   - transactions/status
   verbs:

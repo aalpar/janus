@@ -547,7 +547,7 @@ func transactionYAML(name string, changes ...txnChange) string {
 // transactionYAMLWithSA builds Transaction YAML with a custom ServiceAccount.
 func transactionYAMLWithSA(name, sa string, changes ...txnChange) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, `apiVersion: backup.janus.io/v1alpha1
+	fmt.Fprintf(&b, `apiVersion: tx.janus.io/v1alpha1
 kind: Transaction
 metadata:
   name: %s

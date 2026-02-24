@@ -33,32 +33,6 @@ rules:
   - list
   - watch
 - apiGroups:
-  - backup.janus.io
-  resources:
-  - transactions
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - backup.janus.io
-  resources:
-  - transactions/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - backup.janus.io
-  resources:
-  - transactions/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
@@ -70,3 +44,29 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - tx.janus.io
+  resources:
+  - transactions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - tx.janus.io
+  resources:
+  - transactions/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - tx.janus.io
+  resources:
+  - transactions/status
+  verbs:
+  - get
+  - patch
+  - update

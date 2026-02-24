@@ -425,7 +425,7 @@ const (
 	defaultTimeout            = 5 * time.Minute
 	defaultTransactionTimeout = 30 * time.Minute
 	rollbackCMSuffix          = "-rollback"
-	finalizerName             = "backup.janus.io/lease-cleanup"
+	finalizerName             = "tx.janus.io/lease-cleanup"
 )
 
 func (r *TransactionReconciler) transactionTimeout(txn *backupv1alpha1.Transaction) time.Duration {
@@ -465,7 +465,7 @@ Expected: PASS
 
 ```
 git add api/v1alpha1/transaction_types.go api/v1alpha1/zz_generated.deepcopy.go \
-        config/crd/bases/backup.janus.io_transactions.yaml \
+        config/crd/bases/tx.janus.io_transactions.yaml \
         internal/controller/transaction_controller.go \
         internal/controller/transaction_controller_test.go
 git commit -m "Add transaction-level timeout with 30m default"
@@ -523,7 +523,7 @@ func SetupWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/validate-backup-janus-io-v1alpha1-transaction,mutating=false,failurePolicy=fail,sideEffects=None,groups=backup.janus.io,resources=transactions,verbs=create;update,versions=v1alpha1,name=vtransaction-v1alpha1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-backup-janus-io-v1alpha1-transaction,mutating=false,failurePolicy=fail,sideEffects=None,groups=tx.janus.io,resources=transactions,verbs=create;update,versions=v1alpha1,name=vtransaction-v1alpha1.kb.io,admissionReviewVersions=v1
 
 func (v *TransactionCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
 	txn := obj.(*Transaction)

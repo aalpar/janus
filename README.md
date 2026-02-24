@@ -178,7 +178,7 @@ after a crash.
 ## Example
 
 ```yaml
-apiVersion: backup.janus.io/v1alpha1
+apiVersion: tx.janus.io/v1alpha1
 kind: Transaction
 metadata:
   name: deploy-v2
@@ -222,7 +222,7 @@ to its prior state.
 
 ### CRD: Transaction
 
-A single CRD in the `backup.janus.io/v1alpha1` API group. The spec is an
+A single CRD in the `tx.janus.io/v1alpha1` API group. The spec is an
 ordered list of resource changes; the status tracks per-item progress through
 the state machine.
 
@@ -374,7 +374,7 @@ created on the next transaction that uses that SA.
 
 ### Finalizer
 
-Every Transaction gets a `backup.janus.io/lease-cleanup` finalizer before
+Every Transaction gets a `tx.janus.io/lease-cleanup` finalizer before
 any work begins. This ensures that if a Transaction is deleted while leases
 are held, the controller gets a chance to release them. The finalizer is
 stripped once the Transaction reaches a terminal phase (Committed, RolledBack,

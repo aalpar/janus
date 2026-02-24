@@ -8,7 +8,7 @@ metadata:
   name: transaction-viewer-role
 rules:
 - apiGroups:
-  - backup.janus.io
+  - tx.janus.io
   resources:
   - transactions
   verbs:
@@ -16,7 +16,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - backup.janus.io
+  - tx.janus.io
   resources:
   - transactions/status
   verbs:

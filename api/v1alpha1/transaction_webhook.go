@@ -24,7 +24,7 @@ func SetupWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/validate-backup-janus-io-v1alpha1-transaction,mutating=false,failurePolicy=fail,sideEffects=None,groups=backup.janus.io,resources=transactions,verbs=create;update,versions=v1alpha1,name=vtransaction-v1alpha1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-backup-janus-io-v1alpha1-transaction,mutating=false,failurePolicy=fail,sideEffects=None,groups=tx.janus.io,resources=transactions,verbs=create;update,versions=v1alpha1,name=vtransaction-v1alpha1.kb.io,admissionReviewVersions=v1
 
 func (v *TransactionCustomValidator) ValidateCreate(_ context.Context, txn *Transaction) (admission.Warnings, error) {
 	return nil, validateTransactionSpec(txn, nil)

@@ -1,4 +1,4 @@
-apiVersion: backup.janus.io/v1alpha1
+apiVersion: tx.janus.io/v1alpha1
 kind: Transaction
 metadata:
   name: create-configmap-txn

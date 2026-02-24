@@ -15,7 +15,7 @@ webhooks:
   name: vtransaction-v1alpha1.kb.io
   rules:
   - apiGroups:
-    - backup.janus.io
+    - tx.janus.io
     apiVersions:
     - v1alpha1
     operations:
