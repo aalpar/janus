@@ -4,7 +4,7 @@ metadata:
   name: patch-configmap-txn
   namespace: default
 spec:
-  serviceAccountName: default
+  serviceAccountName: janus-txn
   changes:
     # Patches an existing ConfigMap using server-side apply.
     # Only the fields specified in content are merged; existing keys are preserved.

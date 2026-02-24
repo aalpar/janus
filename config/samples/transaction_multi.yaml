@@ -4,7 +4,7 @@ metadata:
   name: multi-op-txn
   namespace: default
 spec:
-  serviceAccountName: default
+  serviceAccountName: janus-txn
   lockTimeout: 5m
   changes:
     # 1. Create a new ConfigMap

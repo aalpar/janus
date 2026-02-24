@@ -4,7 +4,7 @@ metadata:
   name: create-configmap-txn
   namespace: default
 spec:
-  serviceAccountName: default
+  serviceAccountName: janus-txn
   changes:
     - target:
         apiVersion: v1

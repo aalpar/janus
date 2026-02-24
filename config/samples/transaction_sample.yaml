@@ -4,6 +4,7 @@ metadata:
   name: multi-resource-txn
   namespace: default
 spec:
+  serviceAccountName: janus-txn
   lockTimeout: 5m
   changes:
     # 1. Update a ConfigMap
