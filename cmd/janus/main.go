@@ -18,10 +18,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -32,20 +34,249 @@ import (
 	"github.com/aalpar/janus/internal/scheme"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	sigsyaml "sigs.k8s.io/yaml"
 )
 
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "create":
+			os.Exit(runCreate(os.Args[2:]))
+		case "add":
+			os.Exit(runAdd(os.Args[2:]))
+		case "seal":
+			os.Exit(runSeal(os.Args[2:]))
 		case "recover":
 			os.Exit(runRecover(os.Args[2:]))
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Usage: janus <command>\n\nCommands:\n  recover   Plan or apply manual recovery for a failed transaction\n")
+	fmt.Fprintf(os.Stderr, `Usage: janus <command>
+
+Commands:
+  create    Create an unsealed Transaction
+  add       Add a ResourceChange to a Transaction
+  seal      Seal a Transaction to begin processing
+  recover   Plan or apply manual recovery for a failed transaction
+`)
 	os.Exit(1)
 }
+
+// --- create subcommand ---
+
+func runCreate(args []string) int {
+	fs := flag.NewFlagSet("create", flag.ExitOnError)
+	namespace := fs.String("n", "default", "namespace")
+	sa := fs.String("sa", "", "service account name (required)")
+	lockTimeout := fs.String("lock-timeout", "", "per-resource lock timeout (e.g. 5m)")
+	timeout := fs.String("timeout", "", "overall transaction timeout (e.g. 30m)")
+	fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: janus create <name> --sa <service-account> [-n namespace]\n")
+		return 1
+	}
+	if *sa == "" {
+		fmt.Fprintf(os.Stderr, "Error: --sa is required\n")
+		return 1
+	}
+	txnName := fs.Arg(0)
+
+	ctx := context.Background()
+	cl, err := buildClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
+		return 1
+	}
+
+	txn := &backupv1alpha1.Transaction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      txnName,
+			Namespace: *namespace,
+		},
+		Spec: backupv1alpha1.TransactionSpec{
+			ServiceAccountName: *sa,
+		},
+	}
+	if *lockTimeout != "" {
+		d, err := parseDuration(*lockTimeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid --lock-timeout: %v\n", err)
+			return 1
+		}
+		txn.Spec.LockTimeout = d
+	}
+	if *timeout != "" {
+		d, err := parseDuration(*timeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid --timeout: %v\n", err)
+			return 1
+		}
+		txn.Spec.Timeout = d
+	}
+
+	if err := cl.Create(ctx, txn); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating Transaction: %v\n", err)
+		return 1
+	}
+	fmt.Printf("Transaction %s/%s created (unsealed)\n", txn.Namespace, txn.Name)
+	return 0
+}
+
+// --- add subcommand ---
+
+func runAdd(args []string) int {
+	fs := flag.NewFlagSet("add", flag.ExitOnError)
+	namespace := fs.String("n", "default", "namespace")
+	changeType := fs.String("type", "", "change type: Create, Update, Patch, or Delete (required)")
+	target := fs.String("target", "", "target resource as Kind/Name (required)")
+	targetNS := fs.String("target-ns", "", "target resource namespace (defaults to transaction namespace)")
+	contentFile := fs.String("f", "", "path to content YAML file")
+	order := fs.Int("order", 0, "execution order (lower executes first)")
+	changeName := fs.String("name", "", "ResourceChange name (auto-generated if omitted)")
+	fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: janus add <transaction-name> --type <Type> --target <Kind/Name> [-f content.yaml] [--order N] [-n namespace]\n")
+		return 1
+	}
+	if *changeType == "" || *target == "" {
+		fmt.Fprintf(os.Stderr, "Error: --type and --target are required\n")
+		return 1
+	}
+
+	txnName := fs.Arg(0)
+
+	// Parse target Kind/Name.
+	parts := strings.SplitN(*target, "/", 2)
+	if len(parts) != 2 {
+		fmt.Fprintf(os.Stderr, "Error: --target must be Kind/Name (e.g. ConfigMap/my-cm)\n")
+		return 1
+	}
+	kind, name := parts[0], parts[1]
+
+	ctx := context.Background()
+	cl, err := buildClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
+		return 1
+	}
+
+	// Load Transaction to get UID and verify it's not sealed.
+	txn := &backupv1alpha1.Transaction{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: txnName, Namespace: *namespace}, txn); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot find Transaction %q in namespace %q: %v\n", txnName, *namespace, err)
+		return 1
+	}
+	if txn.Spec.Sealed {
+		fmt.Fprintf(os.Stderr, "Error: Transaction %q is already sealed\n", txnName)
+		return 1
+	}
+
+	// Determine target namespace.
+	tns := *namespace
+	if *targetNS != "" {
+		tns = *targetNS
+	}
+
+	// Determine apiVersion from kind (best-effort for core resources).
+	apiVersion := guessAPIVersion(kind)
+
+	// Read content if provided.
+	var content runtime.RawExtension
+	if *contentFile != "" {
+		data, err := os.ReadFile(*contentFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading content file: %v\n", err)
+			return 1
+		}
+		jsonData, err := yamlToJSON(data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error converting content to JSON: %v\n", err)
+			return 1
+		}
+		content = runtime.RawExtension{Raw: jsonData}
+	}
+
+	// Auto-generate name if not specified.
+	rcName := *changeName
+	if rcName == "" {
+		rcName = fmt.Sprintf("%s-%s-%s", txnName, strings.ToLower(*changeType), strings.ToLower(name))
+	}
+
+	rc := &backupv1alpha1.ResourceChange{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rcName,
+			Namespace: *namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: backupv1alpha1.GroupVersion.String(),
+				Kind:       "Transaction",
+				Name:       txn.Name,
+				UID:        txn.UID,
+			}},
+		},
+		Spec: backupv1alpha1.ResourceChangeSpec{
+			Target: backupv1alpha1.ResourceRef{
+				APIVersion: apiVersion,
+				Kind:       kind,
+				Name:       name,
+				Namespace:  tns,
+			},
+			Type:    backupv1alpha1.ChangeType(*changeType),
+			Content: content,
+			Order:   int32(*order),
+		},
+	}
+
+	if err := cl.Create(ctx, rc); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating ResourceChange: %v\n", err)
+		return 1
+	}
+	fmt.Printf("ResourceChange %s/%s created (type=%s, target=%s/%s, order=%d)\n",
+		rc.Namespace, rc.Name, *changeType, kind, name, *order)
+	return 0
+}
+
+// --- seal subcommand ---
+
+func runSeal(args []string) int {
+	fs := flag.NewFlagSet("seal", flag.ExitOnError)
+	namespace := fs.String("n", "default", "namespace")
+	fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: janus seal <transaction-name> [-n namespace]\n")
+		return 1
+	}
+	txnName := fs.Arg(0)
+
+	ctx := context.Background()
+	cl, err := buildClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
+		return 1
+	}
+
+	patch := []byte(`{"spec":{"sealed":true}}`)
+	txn := &backupv1alpha1.Transaction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      txnName,
+			Namespace: *namespace,
+		},
+	}
+	if err := cl.Patch(ctx, txn, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		fmt.Fprintf(os.Stderr, "Error sealing Transaction: %v\n", err)
+		return 1
+	}
+	fmt.Printf("Transaction %s/%s sealed\n", *namespace, txnName)
+	return 0
+}
+
+// --- recover subcommand ---
 
 func runRecover(args []string) int {
 	if len(args) == 0 {
@@ -190,6 +421,8 @@ func runRecoverApply(txnName, namespace string, force bool) int {
 	return 0
 }
 
+// --- helpers ---
+
 func buildClient() (client.Client, error) {
 	cfg, err := config.GetConfig()
 	if err != nil {
@@ -200,4 +433,37 @@ func buildClient() (client.Client, error) {
 		return nil, fmt.Errorf("creating client: %w", err)
 	}
 	return cl, nil
+}
+
+// parseDuration parses a Go duration string into a metav1.Duration.
+func parseDuration(s string) (*metav1.Duration, error) {
+	var d metav1.Duration
+	if err := d.UnmarshalJSON([]byte(`"` + s + `"`)); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// guessAPIVersion returns a best-effort apiVersion for common resource kinds.
+func guessAPIVersion(kind string) string {
+	switch kind {
+	case "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet":
+		return "apps/v1"
+	case "Ingress":
+		return "networking.k8s.io/v1"
+	case "Job", "CronJob":
+		return "batch/v1"
+	case "HorizontalPodAutoscaler":
+		return "autoscaling/v2"
+	default:
+		return "v1"
+	}
+}
+
+// yamlToJSON converts YAML bytes to JSON bytes.
+func yamlToJSON(data []byte) ([]byte, error) {
+	if json.Valid(data) {
+		return data, nil
+	}
+	return sigsyaml.YAMLToJSON(data)
 }
