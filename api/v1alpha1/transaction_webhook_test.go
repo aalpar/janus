@@ -14,18 +14,11 @@ func validTxn() *Transaction {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-txn", Namespace: "default"},
 		Spec: TransactionSpec{
 			ServiceAccountName: "test-sa",
-			Changes: []ResourceChange{{
-				Target: ResourceRef{
-					APIVersion: "v1",
-					Kind:       "ConfigMap",
-					Name:       "my-cm",
-				},
-				Type:    ChangeTypeCreate,
-				Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap"}`)},
-			}},
 		},
 	}
 }
+
+// --- Transaction webhook tests ---
 
 func TestValidateCreate_ValidSpec(t *testing.T) {
 	v := &TransactionCustomValidator{}
@@ -35,54 +28,39 @@ func TestValidateCreate_ValidSpec(t *testing.T) {
 	}
 }
 
-func TestValidateCreate_MissingContent(t *testing.T) {
+func TestValidateUpdate_SealTransaction(t *testing.T) {
 	v := &TransactionCustomValidator{}
-	txn := validTxn()
-	txn.Spec.Changes[0].Content = runtime.RawExtension{}
-	_, err := v.ValidateCreate(context.Background(), txn)
-	if err == nil {
-		t.Fatal("expected error for missing content on Create")
-	}
-}
-
-func TestValidateCreate_DeleteWithContent(t *testing.T) {
-	v := &TransactionCustomValidator{}
-	txn := validTxn()
-	txn.Spec.Changes[0].Type = ChangeTypeDelete
-	_, err := v.ValidateCreate(context.Background(), txn)
-	if err == nil {
-		t.Fatal("expected error for Delete with content")
-	}
-}
-
-func TestValidateCreate_DeleteWithoutContent(t *testing.T) {
-	v := &TransactionCustomValidator{}
-	txn := validTxn()
-	txn.Spec.Changes[0].Type = ChangeTypeDelete
-	txn.Spec.Changes[0].Content = runtime.RawExtension{}
-	_, err := v.ValidateCreate(context.Background(), txn)
+	oldTxn := validTxn()
+	newTxn := validTxn()
+	newTxn.Spec.Sealed = true
+	_, err := v.ValidateUpdate(context.Background(), oldTxn, newTxn)
 	if err != nil {
-		t.Fatalf("expected no error for Delete without content, got %v", err)
+		t.Fatalf("expected no error for sealing, got %v", err)
 	}
 }
 
-func TestValidateCreate_EmptyTargetFields(t *testing.T) {
+func TestValidateUpdate_CannotUnseal(t *testing.T) {
 	v := &TransactionCustomValidator{}
-	txn := validTxn()
-	txn.Spec.Changes[0].Target = ResourceRef{}
-	_, err := v.ValidateCreate(context.Background(), txn)
+	oldTxn := validTxn()
+	oldTxn.Spec.Sealed = true
+	newTxn := validTxn()
+	newTxn.Spec.Sealed = false
+	_, err := v.ValidateUpdate(context.Background(), oldTxn, newTxn)
 	if err == nil {
-		t.Fatal("expected error for empty target fields")
+		t.Fatal("expected error for unsealing")
 	}
 }
 
-func TestValidateCreate_DuplicateTargets(t *testing.T) {
+func TestValidateUpdate_ImmutableOnceSealed(t *testing.T) {
 	v := &TransactionCustomValidator{}
-	txn := validTxn()
-	txn.Spec.Changes = append(txn.Spec.Changes, txn.Spec.Changes[0])
-	_, err := v.ValidateCreate(context.Background(), txn)
+	oldTxn := validTxn()
+	oldTxn.Spec.Sealed = true
+	newTxn := validTxn()
+	newTxn.Spec.Sealed = true
+	newTxn.Spec.ServiceAccountName = "different-sa"
+	_, err := v.ValidateUpdate(context.Background(), oldTxn, newTxn)
 	if err == nil {
-		t.Fatal("expected error for duplicate targets")
+		t.Fatal("expected error for spec change after sealing")
 	}
 }
 
@@ -134,5 +112,71 @@ func TestValidateUpdate_AllowStatusOnlyChange(t *testing.T) {
 	_, err := v.ValidateUpdate(context.Background(), oldTxn, newTxn)
 	if err != nil {
 		t.Fatalf("expected no error for status-only change, got %v", err)
+	}
+}
+
+// --- ResourceChange webhook tests ---
+
+func validResourceChange() *ResourceChange {
+	return &ResourceChange{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-rc", Namespace: "default"},
+		Spec: ResourceChangeSpec{
+			Target: ResourceRef{
+				APIVersion: "v1",
+				Kind:       "ConfigMap",
+				Name:       "my-cm",
+			},
+			Type:    ChangeTypeCreate,
+			Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap"}`)},
+		},
+	}
+}
+
+func TestResourceChange_ValidCreate(t *testing.T) {
+	v := &ResourceChangeCustomValidator{}
+	_, err := v.ValidateCreate(context.Background(), validResourceChange())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestResourceChange_MissingContent(t *testing.T) {
+	v := &ResourceChangeCustomValidator{}
+	rc := validResourceChange()
+	rc.Spec.Content = runtime.RawExtension{}
+	_, err := v.ValidateCreate(context.Background(), rc)
+	if err == nil {
+		t.Fatal("expected error for missing content on Create")
+	}
+}
+
+func TestResourceChange_DeleteWithContent(t *testing.T) {
+	v := &ResourceChangeCustomValidator{}
+	rc := validResourceChange()
+	rc.Spec.Type = ChangeTypeDelete
+	_, err := v.ValidateCreate(context.Background(), rc)
+	if err == nil {
+		t.Fatal("expected error for Delete with content")
+	}
+}
+
+func TestResourceChange_DeleteWithoutContent(t *testing.T) {
+	v := &ResourceChangeCustomValidator{}
+	rc := validResourceChange()
+	rc.Spec.Type = ChangeTypeDelete
+	rc.Spec.Content = runtime.RawExtension{}
+	_, err := v.ValidateCreate(context.Background(), rc)
+	if err != nil {
+		t.Fatalf("expected no error for Delete without content, got %v", err)
+	}
+}
+
+func TestResourceChange_EmptyTargetFields(t *testing.T) {
+	v := &ResourceChangeCustomValidator{}
+	rc := validResourceChange()
+	rc.Spec.Target = ResourceRef{}
+	_, err := v.ValidateCreate(context.Background(), rc)
+	if err == nil {
+		t.Fatal("expected error for empty target fields")
 	}
 }
