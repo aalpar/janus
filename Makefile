@@ -107,12 +107,19 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager ./cmd/
+build: build-cli build-controller ## Build all binaries.
+
+.PHONY: build-cli
+build-cli: manifests generate fmt vet ## Build CLI binary.
+	go build -o bin/janus ./cmd/janus/
+
+.PHONY: build-controller
+build-controller: manifests generate fmt vet ## Build controller binary.
+	go build -o bin/controller ./cmd/controller/
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/
+	go run ./cmd/controller/
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.

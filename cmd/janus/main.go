@@ -23,13 +23,29 @@ import (
 	"fmt"
 	"os"
 
+	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	// to ensure that exec-entrypoint and run can make use of them.
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+
 	backupv1alpha1 "github.com/aalpar/janus/api/v1alpha1"
 	"github.com/aalpar/janus/internal/recover"
+	"github.com/aalpar/janus/internal/scheme"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
+
+func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "recover":
+			os.Exit(runRecover(os.Args[2:]))
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Usage: janus <command>\n\nCommands:\n  recover   Plan or apply manual recovery for a failed transaction\n")
+	os.Exit(1)
+}
 
 func runRecover(args []string) int {
 	if len(args) == 0 {
@@ -179,7 +195,7 @@ func buildClient() (client.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading kubeconfig: %w", err)
 	}
-	cl, err := client.New(cfg, client.Options{Scheme: scheme})
+	cl, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	if err != nil {
 		return nil, fmt.Errorf("creating client: %w", err)
 	}
