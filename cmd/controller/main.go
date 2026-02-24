@@ -126,6 +126,10 @@ func run() int {
 			setupLog.Error(err, "unable to create webhook", "webhook", "Transaction")
 			return 1
 		}
+		if err := backupv1alpha1.SetupResourceChangeWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "ResourceChange")
+			return 1
+		}
 	} else {
 		setupLog.Info("running outside cluster, skipping webhook registration")
 	}
