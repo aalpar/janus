@@ -59,12 +59,12 @@ func TestEnvelopeCreateHasNilPriorState(t *testing.T) {
 
 func TestMetaMarshalRoundTrip(t *testing.T) {
 	orig := Meta{
-		Version:              1,
+		Version:              2,
 		TransactionName:      "restore-backup-1",
 		TransactionNamespace: "default",
 		Changes: []MetaChange{
 			{
-				Index: 0,
+				Name: "my-cm-change",
 				Target: MetaTarget{
 					APIVersion: "v1",
 					Kind:       "ConfigMap",
@@ -75,7 +75,7 @@ func TestMetaMarshalRoundTrip(t *testing.T) {
 				RollbackKey: "ConfigMap_default_my-cm",
 			},
 			{
-				Index: 1,
+				Name: "my-deploy-change",
 				Target: MetaTarget{
 					APIVersion: "apps/v1",
 					Kind:       "Deployment",
@@ -112,8 +112,8 @@ func TestMetaMarshalRoundTrip(t *testing.T) {
 	}
 	for i, wantC := range orig.Changes {
 		gotC := got.Changes[i]
-		if gotC.Index != wantC.Index {
-			t.Errorf("Changes[%d].Index = %d, want %d", i, gotC.Index, wantC.Index)
+		if gotC.Name != wantC.Name {
+			t.Errorf("Changes[%d].Name = %q, want %q", i, gotC.Name, wantC.Name)
 		}
 		if gotC.Target != wantC.Target {
 			t.Errorf("Changes[%d].Target = %+v, want %+v", i, gotC.Target, wantC.Target)

@@ -22,7 +22,7 @@ const (
 
 // PlanItem represents one rollback operation in the recovery plan.
 type PlanItem struct {
-	Index     int
+	Name      string // name of the ResourceChange CR
 	Target    rollback.MetaTarget
 	Operation string // "DELETE" (reverse of Create) or "RESTORE" (reverse of Update/Patch/Delete)
 	Status    ItemStatus
@@ -46,7 +46,8 @@ type ItemStatusInfo struct {
 
 // BuildPlan constructs a recovery plan from the rollback ConfigMap.
 // txnItems is optional -- if nil, all items are treated as pending rollback.
-func BuildPlan(rbCM *corev1.ConfigMap, txnItems []ItemStatusInfo) (*Plan, error) {
+// The map is keyed by ResourceChange CR name.
+func BuildPlan(rbCM *corev1.ConfigMap, txnItems map[string]ItemStatusInfo) (*Plan, error) {
 	rawMeta, ok := rbCM.Data[rollback.MetaKey]
 	if !ok {
 		return nil, fmt.Errorf("rollback ConfigMap missing %s key", rollback.MetaKey)
@@ -75,17 +76,17 @@ func BuildPlan(rbCM *corev1.ConfigMap, txnItems []ItemStatusInfo) (*Plan, error)
 		}
 
 		status := StatusPending
-		if txnItems != nil && ch.Index < len(txnItems) {
-			if txnItems[ch.Index].RolledBack {
+		if info, ok := txnItems[ch.Name]; ok {
+			if info.RolledBack {
 				status = StatusDone
 			}
-			if !txnItems[ch.Index].Committed {
+			if !info.Committed {
 				status = StatusDone // never committed, nothing to roll back
 			}
 		}
 
 		plan.Items = append(plan.Items, PlanItem{
-			Index:     ch.Index,
+			Name:      ch.Name,
 			Target:    ch.Target,
 			Operation: op,
 			Status:    status,
@@ -105,14 +106,14 @@ func FormatPlan(p *Plan) string {
 		target := fmt.Sprintf("%s/%s/%s", item.Target.Kind, item.Target.Namespace, item.Target.Name)
 		switch item.Status {
 		case StatusDone:
-			fmt.Fprintf(&b, "  %d. [done]     %s %s\n", item.Index, item.Operation, target)
+			fmt.Fprintf(&b, "  - [done]     %s %s (%s)\n", item.Operation, target, item.Name)
 		case StatusConflict:
-			fmt.Fprintf(&b, "  %d. [conflict] %s %s\n", item.Index, item.Operation, target)
+			fmt.Fprintf(&b, "  - [conflict] %s %s (%s)\n", item.Operation, target, item.Name)
 			if item.Reason != "" {
-				fmt.Fprintf(&b, "                %s\n", item.Reason)
+				fmt.Fprintf(&b, "               %s\n", item.Reason)
 			}
 		default:
-			fmt.Fprintf(&b, "  %d. [pending]  %s %s\n", item.Index, item.Operation, target)
+			fmt.Fprintf(&b, "  - [pending]  %s %s (%s)\n", item.Operation, target, item.Name)
 		}
 	}
 	return b.String()

@@ -123,6 +123,13 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, t))).To(Succeed())
 		}
 
+		// Clean up ResourceChanges.
+		rcList := &backupv1alpha1.ResourceChangeList{}
+		Expect(k8sClient.List(ctx, rcList, client.InNamespace(testNamespace))).To(Succeed())
+		for i := range rcList.Items {
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, &rcList.Items[i]))).To(Succeed())
+		}
+
 		// Clean up ConfigMaps created by the controller.
 		cmList := &corev1.ConfigMapList{}
 		Expect(k8sClient.List(ctx, cmList, client.InNamespace(testNamespace),
@@ -163,19 +170,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "txn-created-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange(txnName, "txn-created-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "txn-created-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Reconcile: adds finalizer.
 			result, err := reconciler.Reconcile(ctx, req(txnName))
@@ -264,19 +273,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "existing-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypePatch,
-						Content: runtime.RawExtension{Raw: patchContent},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("update-txn", "existing-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "existing-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Reconcile through all phases.
 			for range 15 {
@@ -301,42 +312,27 @@ var _ = Describe("Transaction Controller", func() {
 		})
 	})
 
-	Context("when a transaction has an empty changes list validation", func() {
-		It("should create the Transaction object with changes", func() {
-			cmContent := map[string]any{
-				"apiVersion": "v1",
-				"kind":       "ConfigMap",
-				"metadata": map[string]any{
-					"name":      "validation-cm",
-					"namespace": testNamespace,
-				},
-				"data": map[string]any{
-					"test": "data",
-				},
-			}
-			raw, err := json.Marshal(cmContent)
-			Expect(err).NotTo(HaveOccurred())
-
+	Context("when a transaction is unsealed", func() {
+		It("should be ignored by the controller", func() {
 			txn := &backupv1alpha1.Transaction{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "valid-txn",
+					Name:      "unsealed-txn",
 					Namespace: testNamespace,
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "validation-cm",
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             false,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
-			Expect(txn.Spec.Changes).To(HaveLen(1))
+
+			result, err := reconciler.Reconcile(ctx, req("unsealed-txn"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			// Verify no phase change.
+			Expect(k8sClient.Get(ctx, nn("unsealed-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(BeEmpty())
 		})
 	})
 
@@ -359,18 +355,20 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "delete-target-cm",
-							Namespace:  testNamespace,
-						},
-						Type: backupv1alpha1.ChangeTypeDelete,
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("delete-txn", "delete-target-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "delete-target-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "delete-txn", backupv1alpha1.TransactionPhaseCommitted)
 
@@ -413,19 +411,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "update-replace-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeUpdate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("update-replace-txn", "update-replace-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "update-replace-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "update-replace-txn", backupv1alpha1.TransactionPhaseCommitted)
 
@@ -464,22 +464,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-patch-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("rb-new-cm"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-multi-txn", "rb-patch-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-patch-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-multi-txn", "rb-new-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			// Use real lock manager through prepare and first commit.
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
@@ -561,19 +562,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "lock-fail-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("lock-fail-txn", "lock-fail-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "lock-fail-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Add finalizer.
 			_, err := reconciler.Reconcile(ctx, req("lock-fail-txn"))
@@ -622,22 +625,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-created-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: createRaw},
-						},
-						blockerChange("rb-created-cm-2"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-create-txn", "rb-created-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-created-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: createRaw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-create-txn", "rb-created-cm-2", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			// Use real lock manager through prepare and first commit.
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
@@ -691,21 +695,22 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-deleted-cm",
-								Namespace:  testNamespace,
-							},
-							Type: backupv1alpha1.ChangeTypeDelete,
-						},
-						blockerChange("rb-delete-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-delete-txn", "rb-deleted-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-deleted-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-delete-txn", "rb-delete-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -758,15 +763,7 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "dummy",
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"dummy"}}`)},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
@@ -792,15 +789,7 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "dummy2",
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"dummy2"}}`)},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
@@ -821,15 +810,7 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "dummy3",
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"dummy3"}}`)},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
@@ -873,31 +854,32 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "multi-cm-1",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: raw1},
-						},
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "multi-cm-2",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: raw2},
-						},
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc1 := createChange("multi-txn", "multi-cm-1-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "multi-cm-1",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw1},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc1)).To(Succeed())
+			rc2 := createChange("multi-txn", "multi-cm-2-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "multi-cm-2",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw2},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc2)).To(Succeed())
 
 			reconcileToPhase(reconciler, "multi-txn", backupv1alpha1.TransactionPhaseCommitted)
 
@@ -945,19 +927,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "ns-inherited-cm",
-							// Namespace intentionally empty.
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("ns-txn", "ns-inherited-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ns-inherited-cm",
+					// Namespace intentionally empty.
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "ns-txn", backupv1alpha1.TransactionPhaseCommitted)
 
@@ -974,6 +958,8 @@ var _ = Describe("Transaction Controller", func() {
 		It("should add the finalizer on first reconcile", func() {
 			txn := minimalTxn("fin-add")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("fin-add", "fin-add-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, req("fin-add"))
 			Expect(err).NotTo(HaveOccurred())
@@ -985,6 +971,8 @@ var _ = Describe("Transaction Controller", func() {
 		It("should remove the finalizer at terminal states", func() {
 			txn := minimalTxn("fin-terminal")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("fin-terminal", "fin-terminal-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Add finalizer.
 			_, err := reconciler.Reconcile(ctx, req("fin-terminal"))
@@ -1016,6 +1004,8 @@ var _ = Describe("Transaction Controller", func() {
 
 			txn := minimalTxn("fin-del-prep")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("fin-del-prep", "fin-del-prep-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Add finalizer + Pending → Preparing.
 			reconcileToPhase(reconciler, "fin-del-prep", backupv1alpha1.TransactionPhasePreparing)
@@ -1048,6 +1038,8 @@ var _ = Describe("Transaction Controller", func() {
 
 			txn := minimalTxn("fin-del-pending")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("fin-del-pending", "fin-del-pending-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Add finalizer.
 			_, err := reconciler.Reconcile(ctx, req("fin-del-pending"))
@@ -1088,21 +1080,22 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "idemp-rb-del-cm",
-								Namespace:  testNamespace,
-							},
-							Type: backupv1alpha1.ChangeTypeDelete,
-						},
-						blockerChange("idemp-rb-del-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("idemp-rb-del-txn", "idemp-rb-del-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "idemp-rb-del-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("idemp-rb-del-txn", "idemp-rb-del-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -1163,19 +1156,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "idemp-create-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("idemp-create-txn", "idemp-create-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "idemp-create-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Progress to Committing.
 			reconcileToPhase(reconciler, "idemp-create-txn", backupv1alpha1.TransactionPhaseCommitting)
@@ -1225,22 +1220,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "retry-rb-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("retry-rb-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("retry-rb-txn", "retry-rb-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "retry-rb-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("retry-rb-txn", "retry-rb-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -1305,22 +1301,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "missing-rbcm-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("missing-rbcm-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("missing-rbcm-txn", "missing-rbcm-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "missing-rbcm-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("missing-rbcm-txn", "missing-rbcm-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -1381,22 +1378,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "recover-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("recover-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("recover-txn", "recover-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "recover-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("recover-txn", "recover-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -1445,15 +1443,7 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "no-recover-cm",
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"no-recover-cm"}}`)},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
@@ -1462,6 +1452,7 @@ var _ = Describe("Transaction Controller", func() {
 			txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
 			txn.Status.RollbackRef = "no-recover-txn-rollback"
 			txn.Status.Items = []backupv1alpha1.ItemStatus{{
+				Name:       "no-recover-cm-change",
 				Committed:  true,
 				RolledBack: false,
 			}}
@@ -1501,22 +1492,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "stale-err-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("stale-err-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("stale-err-txn", "stale-err-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "stale-err-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("stale-err-txn", "stale-err-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -1580,31 +1572,32 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "renew-cm-1",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: raw1},
-						},
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "renew-cm-2",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: raw2},
-						},
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc1 := createChange("renew-multi-txn", "renew-cm-1-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "renew-cm-1",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw1},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc1)).To(Succeed())
+			rc2 := createChange("renew-multi-txn", "renew-cm-2-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "renew-cm-2",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw2},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc2)).To(Succeed())
 
 			// Use real lock manager through prepare.
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
@@ -1653,18 +1646,20 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: "does-not-exist",
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "missing-sa-cm",
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"missing-sa-cm"}}`)},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("missing-sa-txn", "missing-sa-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "missing-sa-cm",
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"missing-sa-cm"}}`)},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// SA validation now happens in Preparing, so drive through
 			// finalizer + Pending before hitting the missing-SA failure.
@@ -1692,19 +1687,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: unprivSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "unpriv-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("unpriv-sa-txn", "unpriv-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "unpriv-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Reconcile to terminal state — the SA has no RBAC so the
 			// commit fails with 403 and triggers rollback. Since the Create
@@ -1753,22 +1750,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "staledata-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeUpdate,
-							Content: runtime.RawExtension{Raw: updateContent},
-						},
-						blockerChange("staledata-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("staledata-txn", "staledata-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "staledata-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updateContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("staledata-txn", "staledata-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			// Use real lock manager for full transaction execution.
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
@@ -1857,22 +1855,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-edge-noconflict-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("rb-edge-noconflict-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-edge-noconflict-txn", "rb-edge-noconflict-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-edge-noconflict-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-edge-noconflict-txn", "rb-edge-noconflict-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -1943,22 +1942,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-edge-create-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: createRaw},
-						},
-						blockerChange("rb-edge-create-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-edge-create-txn", "rb-edge-create-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-edge-create-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: createRaw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-edge-create-txn", "rb-edge-create-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -2020,22 +2020,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-edge-patch-del-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("rb-edge-patch-del-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-edge-patch-del-txn", "rb-edge-patch-del-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-edge-patch-del-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-edge-patch-del-txn", "rb-edge-patch-del-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -2104,22 +2105,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-edge-upd-del-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeUpdate,
-							Content: runtime.RawExtension{Raw: updateContent},
-						},
-						blockerChange("rb-edge-upd-del-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-edge-upd-del-txn", "rb-edge-upd-del-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-edge-upd-del-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updateContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-edge-upd-del-txn", "rb-edge-upd-del-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -2187,19 +2189,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "conflict-rv-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypePatch,
-						Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"patched"}}`)},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rv-capture-txn", "conflict-rv-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "conflict-rv-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"patched"}}`)},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "rv-capture-txn", backupv1alpha1.TransactionPhasePrepared)
 
@@ -2228,19 +2232,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "conflict-patch-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypePatch,
-						Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"patched"}}`)},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("conflict-patch-txn", "conflict-patch-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "conflict-patch-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"patched"}}`)},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "conflict-patch-txn", backupv1alpha1.TransactionPhasePrepared)
 
@@ -2304,18 +2310,20 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "conflict-delete-cm",
-							Namespace:  testNamespace,
-						},
-						Type: backupv1alpha1.ChangeTypeDelete,
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("conflict-delete-txn", "conflict-delete-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "conflict-delete-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "conflict-delete-txn", backupv1alpha1.TransactionPhasePrepared)
 
@@ -2370,19 +2378,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "conflict-create-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("conflict-create-txn", "conflict-create-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "conflict-create-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "conflict-create-txn", backupv1alpha1.TransactionPhaseCommitted)
 
@@ -2405,6 +2415,8 @@ var _ = Describe("Transaction Controller", func() {
 		It("should set Prepared condition when all items are prepared", func() {
 			txn := minimalTxn("cond-prepared")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("cond-prepared", "cond-prepared-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Drive through: finalizer, Pending→Preparing, prepare item, Preparing→Prepared→Committing
 			reconcileToPhase(reconciler, "cond-prepared", backupv1alpha1.TransactionPhaseCommitting)
@@ -2425,6 +2437,8 @@ var _ = Describe("Transaction Controller", func() {
 		It("should set Committed condition when transaction completes", func() {
 			txn := minimalTxn("cond-committed")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("cond-committed", "cond-committed-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "cond-committed", backupv1alpha1.TransactionPhaseCommitted)
 
@@ -2452,6 +2466,8 @@ var _ = Describe("Transaction Controller", func() {
 			txn := minimalTxn("timeout-no-commits")
 			txn.Spec.Timeout = &metav1.Duration{Duration: 1 * time.Nanosecond}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("timeout-no-commits", "timeout-no-commits-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Reconcile 1: adds finalizer.
 			_, err := reconciler.Reconcile(ctx, req("timeout-no-commits"))
@@ -2511,31 +2527,33 @@ var _ = Describe("Transaction Controller", func() {
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
 					Timeout:            &metav1.Duration{Duration: 10 * time.Minute},
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "timeout-target-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeUpdate,
-							Content: runtime.RawExtension{Raw: updateContent},
-						},
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "timeout-new-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: createContent},
-						},
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc1 := createChange("timeout-with-commits", "timeout-target-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "timeout-target-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updateContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc1)).To(Succeed())
+			rc2 := createChange("timeout-with-commits", "timeout-new-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "timeout-new-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: createContent},
+				Order:   1,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc2)).To(Succeed())
 
 			// Drive through: finalizer, Pending->Preparing, prepare item 0, prepare item 1,
 			// Prepared->Committing, commit item 0 (Update).
@@ -2604,31 +2622,33 @@ var _ = Describe("Transaction Controller", func() {
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
 					Timeout:            &metav1.Duration{Duration: 10 * time.Minute},
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-timeout-target-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeUpdate,
-							Content: runtime.RawExtension{Raw: updateContent},
-						},
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-timeout-new-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeCreate,
-							Content: runtime.RawExtension{Raw: createContent},
-						},
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc1 := createChange("timeout-rollback", "rb-timeout-target-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-timeout-target-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updateContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc1)).To(Succeed())
+			rc2 := createChange("timeout-rollback", "rb-timeout-new-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-timeout-new-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: createContent},
+				Order:   1,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc2)).To(Succeed())
 
 			// Drive through to Committing, then commit item 0.
 			reconcileToPhase(reconciler, "timeout-rollback", backupv1alpha1.TransactionPhaseCommitting)
@@ -2710,22 +2730,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rb-update-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeUpdate,
-							Content: runtime.RawExtension{Raw: updateRaw},
-						},
-						blockerChange("rb-update-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-update-txn", "rb-update-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-update-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updateRaw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-update-txn", "rb-update-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -2788,19 +2809,21 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "conflict-update-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeUpdate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("conflict-update-txn", "conflict-update-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "conflict-update-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "conflict-update-txn", backupv1alpha1.TransactionPhasePrepared)
 
@@ -2866,22 +2889,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "cond-rb-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						blockerChange("cond-rb-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("cond-rb-txn", "cond-rb-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "cond-rb-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("cond-rb-txn", "cond-rb-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
 			reconciler.LockMgr = realLockMgr
@@ -2941,19 +2965,21 @@ var _ = Describe("Transaction Controller", func() {
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
 					LockTimeout:        &metav1.Duration{Duration: 42 * time.Second},
-					Changes: []backupv1alpha1.ResourceChange{{
-						Target: backupv1alpha1.ResourceRef{
-							APIVersion: "v1",
-							Kind:       "ConfigMap",
-							Name:       "lock-timeout-cm",
-							Namespace:  testNamespace,
-						},
-						Type:    backupv1alpha1.ChangeTypeCreate,
-						Content: runtime.RawExtension{Raw: raw},
-					}},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("lock-timeout-txn", "lock-timeout-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "lock-timeout-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Drive through finalizer and Pending → Preparing.
 			reconcileToPhase(reconciler, "lock-timeout-txn", backupv1alpha1.TransactionPhasePreparing)
@@ -2975,6 +3001,8 @@ var _ = Describe("Transaction Controller", func() {
 		It("should contain correct transaction metadata after reaching Prepared", func() {
 			txn := minimalTxn("meta-txn")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("meta-txn", "meta-txn-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			reconcileToPhase(reconciler, "meta-txn", backupv1alpha1.TransactionPhasePrepared)
 
@@ -2989,13 +3017,13 @@ var _ = Describe("Transaction Controller", func() {
 			// Unmarshal and verify contents.
 			var meta rollback.Meta
 			Expect(json.Unmarshal([]byte(raw), &meta)).To(Succeed())
-			Expect(meta.Version).To(Equal(1))
+			Expect(meta.Version).To(Equal(2))
 			Expect(meta.TransactionName).To(Equal("meta-txn"))
 			Expect(meta.TransactionNamespace).To(Equal(testNamespace))
 			Expect(meta.Changes).To(HaveLen(1))
 
 			ch := meta.Changes[0]
-			Expect(ch.Index).To(Equal(0))
+			Expect(ch.Name).To(Equal("meta-txn-cm-change"))
 			Expect(ch.ChangeType).To(Equal(string(backupv1alpha1.ChangeTypeCreate)))
 			Expect(ch.Target.APIVersion).To(Equal("v1"))
 			Expect(ch.Target.Kind).To(Equal("ConfigMap"))
@@ -3038,22 +3066,23 @@ var _ = Describe("Transaction Controller", func() {
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target: backupv1alpha1.ResourceRef{
-								APIVersion: "v1",
-								Kind:       "ConfigMap",
-								Name:       "rbconflict-cm",
-								Namespace:  testNamespace,
-							},
-							Type:    backupv1alpha1.ChangeTypeUpdate,
-							Content: runtime.RawExtension{Raw: updateContent},
-						},
-						blockerChange("rbconflict-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rbconflict-txn", "rbconflict-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rbconflict-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updateContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rbconflict-txn", "rbconflict-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			// Use real lock manager through prepare and commit.
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
@@ -3140,17 +3169,18 @@ var _ = Describe("Transaction Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "ssa-rb-txn", Namespace: testNamespace},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "ssa-rb-cm"},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: raw},
-						},
-						blockerChange("ssa-rb-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("ssa-rb-txn", "ssa-rb-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "ssa-rb-cm"},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("ssa-rb-txn", "ssa-rb-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			// Use real lock manager through prepare and first commit.
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
@@ -3226,22 +3256,25 @@ var _ = Describe("Transaction Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "cpc-txn", Namespace: testNamespace},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
-					Changes: []backupv1alpha1.ResourceChange{
-						{
-							Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "cpc-patch-cm"},
-							Type:    backupv1alpha1.ChangeTypePatch,
-							Content: runtime.RawExtension{Raw: patchContent},
-						},
-						{
-							Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "cpc-upd-cm"},
-							Type:    backupv1alpha1.ChangeTypeUpdate,
-							Content: runtime.RawExtension{Raw: updContent},
-						},
-						blockerChange("cpc-blocker"),
-					},
+					Sealed:             true,
 				},
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc0 := createChange("cpc-txn", "cpc-patch-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "cpc-patch-cm"},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc0)).To(Succeed())
+			rc1 := createChange("cpc-txn", "cpc-upd-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target:  backupv1alpha1.ResourceRef{APIVersion: "v1", Kind: "ConfigMap", Name: "cpc-upd-cm"},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updContent},
+				Order:   1,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc1)).To(Succeed())
+			blocker := blockerChange("cpc-txn", "cpc-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
 
 			// Real lock manager for prepare and commits.
 			realLockMgr := &lock.LeaseManager{Client: k8sClient}
@@ -3327,14 +3360,9 @@ func reconcileToPhase(r *TransactionReconciler, name string, target backupv1alph
 	Expect(txn.Status.Phase).To(Equal(target))
 }
 
-// minimalTxn creates a Transaction with a single Create-ConfigMap change.
+// minimalTxn creates a sealed Transaction with no inline changes.
+// Callers must create ResourceChange CRs separately after the Transaction exists (to get UID).
 func minimalTxn(name string) *backupv1alpha1.Transaction {
-	raw, _ := json.Marshal(map[string]any{
-		"apiVersion": "v1",
-		"kind":       "ConfigMap",
-		"metadata":   map[string]any{"name": name + "-cm", "namespace": testNamespace},
-		"data":       map[string]any{"k": "v"},
-	})
 	return &backupv1alpha1.Transaction{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -3342,18 +3370,47 @@ func minimalTxn(name string) *backupv1alpha1.Transaction {
 		},
 		Spec: backupv1alpha1.TransactionSpec{
 			ServiceAccountName: testSAName,
-			Changes: []backupv1alpha1.ResourceChange{{
-				Target: backupv1alpha1.ResourceRef{
-					APIVersion: "v1",
-					Kind:       "ConfigMap",
-					Name:       name + "-cm",
-					Namespace:  testNamespace,
-				},
-				Type:    backupv1alpha1.ChangeTypeCreate,
-				Content: runtime.RawExtension{Raw: raw},
-			}},
+			Sealed:             true,
 		},
 	}
+}
+
+// createChange creates a ResourceChange CR owned by the named Transaction.
+// The txnUID must be provided after the Transaction is created.
+func createChange(txnName, changeName string, spec backupv1alpha1.ResourceChangeSpec, txnUID types.UID) *backupv1alpha1.ResourceChange {
+	return &backupv1alpha1.ResourceChange{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      changeName,
+			Namespace: testNamespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: backupv1alpha1.GroupVersion.String(),
+				Kind:       "Transaction",
+				Name:       txnName,
+				UID:        txnUID,
+			}},
+		},
+		Spec: spec,
+	}
+}
+
+// createCMChange creates a ResourceChange for creating a ConfigMap.
+func createCMChange(txnName, cmName string, txnUID types.UID) *backupv1alpha1.ResourceChange {
+	raw, _ := json.Marshal(map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": cmName, "namespace": testNamespace},
+		"data":       map[string]any{"k": "v"},
+	})
+	return createChange(txnName, cmName+"-change", backupv1alpha1.ResourceChangeSpec{
+		Target: backupv1alpha1.ResourceRef{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+			Name:       cmName,
+			Namespace:  testNamespace,
+		},
+		Type:    backupv1alpha1.ChangeTypeCreate,
+		Content: runtime.RawExtension{Raw: raw},
+	}, txnUID)
 }
 
 // nn returns a NamespacedName in the test namespace.
@@ -3366,15 +3423,15 @@ func req(name string) ctrl.Request {
 	return ctrl.Request{NamespacedName: nn(name)}
 }
 
-// blockerChange returns a Create-ConfigMap ResourceChange used as a rollback trigger.
-func blockerChange(name string) backupv1alpha1.ResourceChange {
+// blockerChange creates a ResourceChange CR used as a second item to trigger rollback.
+func blockerChange(txnName, name string, txnUID types.UID) *backupv1alpha1.ResourceChange {
 	raw, _ := json.Marshal(map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
 		"metadata":   map[string]any{"name": name, "namespace": testNamespace},
 		"data":       map[string]any{"k": "v"},
 	})
-	return backupv1alpha1.ResourceChange{
+	return createChange(txnName, name+"-change", backupv1alpha1.ResourceChangeSpec{
 		Target: backupv1alpha1.ResourceRef{
 			APIVersion: "v1",
 			Kind:       "ConfigMap",
@@ -3383,7 +3440,8 @@ func blockerChange(name string) backupv1alpha1.ResourceChange {
 		},
 		Type:    backupv1alpha1.ChangeTypeCreate,
 		Content: runtime.RawExtension{Raw: raw},
-	}
+		Order:   1, // Higher order so it processes after the main item
+	}, txnUID)
 }
 
 // failingRenewLockMgr returns a fake lock manager whose Renew always returns ErrLockExpired.

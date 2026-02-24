@@ -37,12 +37,12 @@ func makeRollbackCM(meta rollback.Meta, envelopes map[string]rollback.Envelope) 
 
 func TestBuildPlan_PendingRollback(t *testing.T) {
 	meta := rollback.Meta{
-		Version:              1,
+		Version:              2,
 		TransactionName:      "txn-1",
 		TransactionNamespace: "ns-1",
 		Changes: []rollback.MetaChange{
 			{
-				Index:       0,
+				Name:        "cm-a-change",
 				Target:      rollback.MetaTarget{APIVersion: "v1", Kind: "ConfigMap", Name: "cm-a", Namespace: "ns-1"},
 				ChangeType:  "Patch",
 				RollbackKey: "ConfigMap_ns-1_cm-a",
@@ -79,12 +79,12 @@ func TestBuildPlan_PendingRollback(t *testing.T) {
 
 func TestBuildPlan_CreateIsDelete(t *testing.T) {
 	meta := rollback.Meta{
-		Version:              1,
+		Version:              2,
 		TransactionName:      "txn-2",
 		TransactionNamespace: "ns-1",
 		Changes: []rollback.MetaChange{
 			{
-				Index:       0,
+				Name:        "cm-new-change",
 				Target:      rollback.MetaTarget{APIVersion: "v1", Kind: "ConfigMap", Name: "cm-new", Namespace: "ns-1"},
 				ChangeType:  "Create",
 				RollbackKey: "ConfigMap_ns-1_cm-new",
@@ -114,18 +114,18 @@ func TestBuildPlan_CreateIsDelete(t *testing.T) {
 
 func TestBuildPlan_WithTxnItems(t *testing.T) {
 	meta := rollback.Meta{
-		Version:              1,
+		Version:              2,
 		TransactionName:      "txn-3",
 		TransactionNamespace: "ns-1",
 		Changes: []rollback.MetaChange{
 			{
-				Index:       0,
+				Name:        "cm-a-change",
 				Target:      rollback.MetaTarget{APIVersion: "v1", Kind: "ConfigMap", Name: "cm-a", Namespace: "ns-1"},
 				ChangeType:  "Patch",
 				RollbackKey: "ConfigMap_ns-1_cm-a",
 			},
 			{
-				Index:       1,
+				Name:        "cm-b-change",
 				Target:      rollback.MetaTarget{APIVersion: "v1", Kind: "ConfigMap", Name: "cm-b", Namespace: "ns-1"},
 				ChangeType:  "Update",
 				RollbackKey: "ConfigMap_ns-1_cm-b",
@@ -138,9 +138,9 @@ func TestBuildPlan_WithTxnItems(t *testing.T) {
 	}
 	cm := makeRollbackCM(meta, envelopes)
 
-	txnItems := []ItemStatusInfo{
-		{Committed: true, RolledBack: true},  // item 0: already rolled back
-		{Committed: true, RolledBack: false}, // item 1: committed, not rolled back
+	txnItems := map[string]ItemStatusInfo{
+		"cm-a-change": {Committed: true, RolledBack: true},  // already rolled back
+		"cm-b-change": {Committed: true, RolledBack: false}, // committed, not rolled back
 	}
 
 	plan, err := BuildPlan(cm, txnItems)
@@ -148,21 +148,21 @@ func TestBuildPlan_WithTxnItems(t *testing.T) {
 		t.Fatalf("BuildPlan returned error: %v", err)
 	}
 	if plan.Items[0].Status != StatusDone {
-		t.Errorf("item 0: expected done, got %s", plan.Items[0].Status)
+		t.Errorf("cm-a: expected done, got %s", plan.Items[0].Status)
 	}
 	if plan.Items[1].Status != StatusPending {
-		t.Errorf("item 1: expected pending, got %s", plan.Items[1].Status)
+		t.Errorf("cm-b: expected pending, got %s", plan.Items[1].Status)
 	}
 }
 
 func TestBuildPlan_UncommittedIsDone(t *testing.T) {
 	meta := rollback.Meta{
-		Version:              1,
+		Version:              2,
 		TransactionName:      "txn-4",
 		TransactionNamespace: "ns-1",
 		Changes: []rollback.MetaChange{
 			{
-				Index:       0,
+				Name:        "cm-x-change",
 				Target:      rollback.MetaTarget{APIVersion: "v1", Kind: "ConfigMap", Name: "cm-x", Namespace: "ns-1"},
 				ChangeType:  "Patch",
 				RollbackKey: "ConfigMap_ns-1_cm-x",
@@ -175,8 +175,8 @@ func TestBuildPlan_UncommittedIsDone(t *testing.T) {
 	cm := makeRollbackCM(meta, envelopes)
 
 	// Item was never committed -- nothing to roll back.
-	txnItems := []ItemStatusInfo{
-		{Committed: false, RolledBack: false},
+	txnItems := map[string]ItemStatusInfo{
+		"cm-x-change": {Committed: false, RolledBack: false},
 	}
 
 	plan, err := BuildPlan(cm, txnItems)
@@ -207,9 +207,9 @@ func TestFormatPlan(t *testing.T) {
 		TransactionName:      "txn-fmt",
 		TransactionNamespace: "ns-fmt",
 		Items: []PlanItem{
-			{Index: 0, Target: rollback.MetaTarget{Kind: "ConfigMap", Namespace: "ns-fmt", Name: "cm-done"}, Operation: "RESTORE", Status: StatusDone},
-			{Index: 1, Target: rollback.MetaTarget{Kind: "ConfigMap", Namespace: "ns-fmt", Name: "cm-pending"}, Operation: "DELETE", Status: StatusPending},
-			{Index: 2, Target: rollback.MetaTarget{Kind: "Secret", Namespace: "ns-fmt", Name: "sec-conflict"}, Operation: "RESTORE", Status: StatusConflict, Reason: "resource version mismatch"},
+			{Name: "cm-done-change", Target: rollback.MetaTarget{Kind: "ConfigMap", Namespace: "ns-fmt", Name: "cm-done"}, Operation: "RESTORE", Status: StatusDone},
+			{Name: "cm-pending-change", Target: rollback.MetaTarget{Kind: "ConfigMap", Namespace: "ns-fmt", Name: "cm-pending"}, Operation: "DELETE", Status: StatusPending},
+			{Name: "sec-conflict-change", Target: rollback.MetaTarget{Kind: "Secret", Namespace: "ns-fmt", Name: "sec-conflict"}, Operation: "RESTORE", Status: StatusConflict, Reason: "resource version mismatch"},
 		},
 	}
 	out := FormatPlan(plan)

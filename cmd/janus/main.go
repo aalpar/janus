@@ -93,16 +93,16 @@ func runRecoverPlan(txnName, namespace string) int {
 	}
 
 	// Optionally load Transaction CR for status.
-	var txnItems []recover.ItemStatusInfo
+	var txnItems map[string]recover.ItemStatusInfo
 	txn := &backupv1alpha1.Transaction{}
 	if err := cl.Get(ctx, client.ObjectKey{Name: txnName, Namespace: namespace}, txn); err != nil {
 		if !apierrors.IsNotFound(err) {
 			fmt.Fprintf(os.Stderr, "Warning: cannot read Transaction %q: %v (proceeding from ConfigMap only)\n", txnName, err)
 		}
 	} else {
-		txnItems = make([]recover.ItemStatusInfo, len(txn.Status.Items))
-		for i, item := range txn.Status.Items {
-			txnItems[i] = recover.ItemStatusInfo{
+		txnItems = make(map[string]recover.ItemStatusInfo, len(txn.Status.Items))
+		for _, item := range txn.Status.Items {
+			txnItems[item.Name] = recover.ItemStatusInfo{
 				Committed:  item.Committed,
 				RolledBack: item.RolledBack,
 			}
@@ -139,16 +139,16 @@ func runRecoverApply(txnName, namespace string, force bool) int {
 	}
 
 	// Optionally load Transaction CR for status.
-	var txnItems []recover.ItemStatusInfo
+	var txnItems map[string]recover.ItemStatusInfo
 	txn := &backupv1alpha1.Transaction{}
 	if err := cl.Get(ctx, client.ObjectKey{Name: txnName, Namespace: namespace}, txn); err != nil {
 		if !apierrors.IsNotFound(err) {
 			fmt.Fprintf(os.Stderr, "Warning: cannot read Transaction %q: %v (proceeding from ConfigMap only)\n", txnName, err)
 		}
 	} else {
-		txnItems = make([]recover.ItemStatusInfo, len(txn.Status.Items))
-		for i, item := range txn.Status.Items {
-			txnItems[i] = recover.ItemStatusInfo{
+		txnItems = make(map[string]recover.ItemStatusInfo, len(txn.Status.Items))
+		for _, item := range txn.Status.Items {
+			txnItems[item.Name] = recover.ItemStatusInfo{
 				Committed:  item.Committed,
 				RolledBack: item.RolledBack,
 			}
@@ -168,7 +168,7 @@ func runRecoverApply(txnName, namespace string, force bool) int {
 			continue
 		}
 		target := fmt.Sprintf("%s/%s/%s", item.Target.Kind, item.Target.Namespace, item.Target.Name)
-		fmt.Printf("  %d. %s %s ... ", item.Index, item.Operation, target)
+		fmt.Printf("  - %s %s (%s) ... ", item.Operation, target, item.Name)
 		if err := recover.ApplyItem(ctx, cl, item, rbCM, opts); err != nil {
 			var conflict *recover.ErrConflict
 			if errors.As(err, &conflict) {
