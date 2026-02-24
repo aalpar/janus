@@ -117,7 +117,9 @@ var _ = Describe("Transaction Controller", func() {
 		Expect(k8sClient.List(ctx, txnList, client.InNamespace(testNamespace))).To(Succeed())
 		for i := range txnList.Items {
 			t := &txnList.Items[i]
-			if controllerutil.RemoveFinalizer(t, finalizerName) {
+			changed := controllerutil.RemoveFinalizer(t, finalizerName)
+			changed = controllerutil.RemoveFinalizer(t, rollbackProtectionFinalizer) || changed
+			if changed {
 				Expect(k8sClient.Update(ctx, t)).To(Succeed())
 			}
 			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, t))).To(Succeed())
@@ -186,8 +188,16 @@ var _ = Describe("Transaction Controller", func() {
 			}, txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
-			// Reconcile: adds finalizer.
+			// Reconcile: adds rollback-protection finalizer.
 			result, err := reconciler.Reconcile(ctx, req(txnName))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			Expect(k8sClient.Get(ctx, nn(txnName), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
+
+			// Reconcile: adds lease-cleanup finalizer.
+			result, err = reconciler.Reconcile(ctx, req(txnName))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
@@ -326,7 +336,16 @@ var _ = Describe("Transaction Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 
+			// First reconcile adds rollback-protection finalizer.
 			result, err := reconciler.Reconcile(ctx, req("unsealed-txn"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			Expect(k8sClient.Get(ctx, nn("unsealed-txn"), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
+
+			// Second reconcile: unsealed → no-op.
+			result, err = reconciler.Reconcile(ctx, req("unsealed-txn"))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(ctrl.Result{}))
 
@@ -578,16 +597,11 @@ var _ = Describe("Transaction Controller", func() {
 			}, txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
-			// Add finalizer.
-			_, err := reconciler.Reconcile(ctx, req("lock-fail-txn"))
-			Expect(err).NotTo(HaveOccurred())
-
-			// Pending → Preparing.
-			_, err = reconciler.Reconcile(ctx, req("lock-fail-txn"))
-			Expect(err).NotTo(HaveOccurred())
+			// Drive through finalizers + phases until Preparing, then let lock fail.
+			reconcileToPhase(reconciler, "lock-fail-txn", backupv1alpha1.TransactionPhasePreparing)
 
 			// Preparing → Failed (lock acquisition fails, triggers failAndReleaseLocks).
-			_, err = reconciler.Reconcile(ctx, req("lock-fail-txn"))
+			_, err := reconciler.Reconcile(ctx, req("lock-fail-txn"))
 			// setFailed returns the status update error, which should be nil on success.
 			Expect(err).NotTo(HaveOccurred())
 
@@ -758,8 +772,9 @@ var _ = Describe("Transaction Controller", func() {
 		It("should no-op for Committed", func() {
 			txn := &backupv1alpha1.Transaction{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "terminal-committed",
-					Namespace: testNamespace,
+					Name:       "terminal-committed",
+					Namespace:  testNamespace,
+					Finalizers: []string{finalizerName, rollbackProtectionFinalizer},
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
@@ -772,20 +787,24 @@ var _ = Describe("Transaction Controller", func() {
 			txn.Status.Phase = backupv1alpha1.TransactionPhaseCommitted
 			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
 
+			// Reconcile strips both finalizers.
 			result, err := reconciler.Reconcile(ctx, req("terminal-committed"))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(ctrl.Result{}))
 
-			// Verify phase unchanged.
+			// Verify phase unchanged and finalizers removed.
 			Expect(k8sClient.Get(ctx, nn("terminal-committed"), txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
+			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
+			Expect(txn.Finalizers).NotTo(ContainElement(rollbackProtectionFinalizer))
 		})
 
 		It("should no-op for RolledBack", func() {
 			txn := &backupv1alpha1.Transaction{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "terminal-rolledback",
-					Namespace: testNamespace,
+					Name:       "terminal-rolledback",
+					Namespace:  testNamespace,
+					Finalizers: []string{finalizerName, rollbackProtectionFinalizer},
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
@@ -805,8 +824,9 @@ var _ = Describe("Transaction Controller", func() {
 		It("should no-op for Failed with no un-rolled-back commits", func() {
 			txn := &backupv1alpha1.Transaction{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "terminal-failed",
-					Namespace: testNamespace,
+					Name:       "terminal-failed",
+					Namespace:  testNamespace,
+					Finalizers: []string{finalizerName, rollbackProtectionFinalizer},
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
@@ -955,42 +975,54 @@ var _ = Describe("Transaction Controller", func() {
 	})
 
 	Context("finalizer lifecycle", func() {
-		It("should add the finalizer on first reconcile", func() {
+		It("should add both finalizers on first reconciles", func() {
 			txn := minimalTxn("fin-add")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 			rc := createCMChange("fin-add", "fin-add-cm", txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
+			// First reconcile: rollback-protection.
 			_, err := reconciler.Reconcile(ctx, req("fin-add"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("fin-add"), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
+
+			// Second reconcile: lease-cleanup (after sealed check).
+			_, err = reconciler.Reconcile(ctx, req("fin-add"))
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("fin-add"), txn)).To(Succeed())
 			Expect(txn.Finalizers).To(ContainElement(finalizerName))
 		})
 
-		It("should remove the finalizer at terminal states", func() {
+		It("should remove both finalizers at terminal states", func() {
 			txn := minimalTxn("fin-terminal")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 			rc := createCMChange("fin-terminal", "fin-terminal-cm", txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
-			// Add finalizer.
+			// Add both finalizers.
 			_, err := reconciler.Reconcile(ctx, req("fin-terminal"))
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, req("fin-terminal"))
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("fin-terminal"), txn)).To(Succeed())
 			Expect(txn.Finalizers).To(ContainElement(finalizerName))
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
 
 			// Manually set to Committed.
 			txn.Status.Phase = backupv1alpha1.TransactionPhaseCommitted
 			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
 
-			// Reconcile: terminal → strip finalizer.
+			// Reconcile: terminal → strip both finalizers.
 			_, err = reconciler.Reconcile(ctx, req("fin-terminal"))
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("fin-terminal"), txn)).To(Succeed())
 			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
+			Expect(txn.Finalizers).NotTo(ContainElement(rollbackProtectionFinalizer))
 		})
 
 		It("should release leases on deletion during Preparing", func() {
@@ -1041,7 +1073,7 @@ var _ = Describe("Transaction Controller", func() {
 			rc := createCMChange("fin-del-pending", "fin-del-pending-cm", txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
-			// Add finalizer.
+			// Add rollback-protection finalizer.
 			_, err := reconciler.Reconcile(ctx, req("fin-del-pending"))
 			Expect(err).NotTo(HaveOccurred())
 
@@ -1049,12 +1081,314 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, nn("fin-del-pending"), txn)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
 
-			// Reconcile: handleDeletion with no leases.
+			// Reconcile: handleDeletion with no leases, no unrolled commits.
 			_, err = reconciler.Reconcile(ctx, req("fin-del-pending"))
 			Expect(err).NotTo(HaveOccurred())
 
-			// Object should be gone.
+			// Object should be gone (both finalizers removed).
 			err = k8sClient.Get(ctx, nn("fin-del-pending"), txn)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("should add automatic-rollback annotation at seal time", func() {
+			txn := minimalTxn("fin-auto-rb")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("fin-auto-rb", "fin-auto-rb-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+
+			// Drive to Preparing (handlePending adds annotation).
+			reconcileToPhase(reconciler, "fin-auto-rb", backupv1alpha1.TransactionPhasePreparing)
+
+			Expect(k8sClient.Get(ctx, nn("fin-auto-rb"), txn)).To(Succeed())
+			Expect(txn.Annotations).To(HaveKey(annotationAutoRollback))
+		})
+	})
+
+	Context("safe deletion with rollback", func() {
+		It("should trigger rollback when deleted during Committing with unrolled commits", func() {
+			// Create target ConfigMap.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "del-commit-cm", Namespace: testNamespace},
+				Data:       map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, _ := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+
+			txn := minimalTxn("del-commit-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("del-commit-txn", "del-commit-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1", Kind: "ConfigMap",
+					Name: "del-commit-cm", Namespace: testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			blocker := blockerChange("del-commit-txn", "del-commit-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
+
+			// Commit first item, then trigger lock failure on second.
+			reconcileToPhase(reconciler, "del-commit-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0.
+			_, err := reconciler.Reconcile(ctx, req("del-commit-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("del-commit-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Now delete the transaction (automatic-rollback present from seal time).
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+
+			// Keep reconciling — deletion triggers rollback, then GC.
+			for range 20 {
+				err = k8sClient.Get(ctx, nn("del-commit-txn"), txn)
+				if apierrors.IsNotFound(err) {
+					break
+				}
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconciler.Reconcile(ctx, req("del-commit-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			err = k8sClient.Get(ctx, nn("del-commit-txn"), txn)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			// Verify ConfigMap was restored.
+			Expect(k8sClient.Get(ctx, nn("del-commit-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("original"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+				Name: "del-commit-blocker", Namespace: testNamespace,
+			}})
+		})
+
+		It("should enter protected state when automatic-rollback is removed", func() {
+			reconciler.LockMgr = &fakeLockMgr{}
+
+			// Create a transaction already in Failed state with unrolled commits.
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "del-protected-txn",
+					Namespace:  testNamespace,
+					Finalizers: []string{finalizerName, rollbackProtectionFinalizer},
+					// No automatic-rollback annotation.
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Sealed:             true,
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
+			txn.Status.RollbackRef = "del-protected-txn-rollback"
+			txn.Status.Items = []backupv1alpha1.ItemStatus{{
+				Name: "del-protected-cm-change", Committed: true,
+			}}
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Delete the transaction.
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+
+			// Reconcile: handleDeletion → Failed, no auto-rollback → PROTECTED.
+			_, err := reconciler.Reconcile(ctx, req("del-protected-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Object should still exist (rollback-protection prevents GC).
+			Expect(k8sClient.Get(ctx, nn("del-protected-txn"), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
+			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
+		})
+
+		It("should recover from protected state when automatic-rollback is re-added", func() {
+			// Create target ConfigMap.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "del-retry-cm", Namespace: testNamespace},
+				Data:       map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent, _ := json.Marshal(map[string]any{
+				"data": map[string]any{"key": "patched"},
+			})
+
+			txn := minimalTxn("del-retry-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("del-retry-txn", "del-retry-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1", Kind: "ConfigMap",
+					Name: "del-retry-cm", Namespace: testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: patchContent},
+			}, txn.UID)
+			blocker := blockerChange("del-retry-txn", "del-retry-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
+
+			// Drive to Committing and commit item 0.
+			reconcileToPhase(reconciler, "del-retry-txn", backupv1alpha1.TransactionPhaseCommitting)
+			_, err := reconciler.Reconcile(ctx, req("del-retry-txn"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, nn("del-retry-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Remove automatic-rollback and delete.
+			delete(txn.Annotations, annotationAutoRollback)
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+
+			// Reconcile: no auto-rollback → PROTECTED state.
+			_, err = reconciler.Reconcile(ctx, req("del-retry-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("del-retry-txn"), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
+			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
+
+			// User re-adds automatic-rollback to trigger recovery.
+			if txn.Annotations == nil {
+				txn.Annotations = make(map[string]string)
+			}
+			txn.Annotations[annotationAutoRollback] = "true"
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
+			// Reconcile until GC.
+			for range 20 {
+				err = k8sClient.Get(ctx, nn("del-retry-txn"), txn)
+				if apierrors.IsNotFound(err) {
+					break
+				}
+				Expect(err).NotTo(HaveOccurred())
+				_, err = reconciler.Reconcile(ctx, req("del-retry-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			err = k8sClient.Get(ctx, nn("del-retry-txn"), txn)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			// Verify ConfigMap was restored.
+			Expect(k8sClient.Get(ctx, nn("del-retry-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("original"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+				Name: "del-retry-blocker", Namespace: testNamespace,
+			}})
+		})
+
+		It("should retry-rollback in Failed phase during deletion", func() {
+			reconciler.LockMgr = &fakeLockMgr{}
+
+			// Create a transaction in Failed state with unrolled commits and rollback CM.
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "del-retry-failed-txn",
+					Namespace:  testNamespace,
+					Finalizers: []string{finalizerName, rollbackProtectionFinalizer},
+					Annotations: map[string]string{
+						annotationRetryRollback: "true",
+					},
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Sealed:             true,
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
+			txn.Status.RollbackRef = "del-retry-failed-txn-rollback"
+			txn.Status.Items = []backupv1alpha1.ItemStatus{{
+				Name: "del-retry-failed-cm-change", Committed: true,
+			}}
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Delete the transaction.
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+
+			// Reconcile: handleDeletion sees retry-rollback → removes annotation, transitions to RollingBack.
+			_, err := reconciler.Reconcile(ctx, req("del-retry-failed-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("del-retry-failed-txn"), txn)).To(Succeed())
+			Expect(txn.Annotations).NotTo(HaveKey(annotationRetryRollback))
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+		})
+
+		It("should GC deleted transaction with no unrolled commits", func() {
+			reconciler.LockMgr = &fakeLockMgr{}
+
+			txn := minimalTxn("del-no-unrolled")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("del-no-unrolled", "del-no-unrolled-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+
+			// Drive to Committed (no unrolled commits).
+			reconcileToPhase(reconciler, "del-no-unrolled", backupv1alpha1.TransactionPhaseCommitted)
+
+			// Terminal handler strips both finalizers. Delete should be instant.
+			_, err := reconciler.Reconcile(ctx, req("del-no-unrolled"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("del-no-unrolled"), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(BeEmpty())
+
+			// Delete — no finalizers means immediate GC.
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+			err = k8sClient.Get(ctx, nn("del-no-unrolled"), txn)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			// Clean up created CM.
+			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+				Name: "del-no-unrolled-cm", Namespace: testNamespace,
+			}})
+		})
+
+		It("should force-delete when user removes rollback-protection finalizer", func() {
+			reconciler.LockMgr = &fakeLockMgr{}
+
+			// Create a transaction in PROTECTED state (only rollback-protection finalizer).
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "del-force-txn",
+					Namespace:  testNamespace,
+					Finalizers: []string{rollbackProtectionFinalizer},
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Sealed:             true,
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			txn.Status.Phase = backupv1alpha1.TransactionPhaseFailed
+			txn.Status.Items = []backupv1alpha1.ItemStatus{{
+				Name: "del-force-cm-change", Committed: true,
+			}}
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Delete the transaction.
+			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
+
+			// Verify it's stuck (rollback-protection prevents GC).
+			Expect(k8sClient.Get(ctx, nn("del-force-txn"), txn)).To(Succeed())
+			Expect(txn.DeletionTimestamp).NotTo(BeNil())
+
+			// User removes the finalizer manually.
+			controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
+			// Now the object should be gone.
+			err := k8sClient.Get(ctx, nn("del-force-txn"), txn)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 	})
@@ -1438,8 +1772,9 @@ var _ = Describe("Transaction Controller", func() {
 		It("should stay Failed when un-rolled-back commits exist but rollback CM is missing", func() {
 			txn := &backupv1alpha1.Transaction{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "no-recover-txn",
-					Namespace: testNamespace,
+					Name:       "no-recover-txn",
+					Namespace:  testNamespace,
+					Finalizers: []string{finalizerName, rollbackProtectionFinalizer},
 				},
 				Spec: backupv1alpha1.TransactionSpec{
 					ServiceAccountName: testSAName,
@@ -2469,17 +2804,12 @@ var _ = Describe("Transaction Controller", func() {
 			rc := createCMChange("timeout-no-commits", "timeout-no-commits-cm", txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
-			// Reconcile 1: adds finalizer.
-			_, err := reconciler.Reconcile(ctx, req("timeout-no-commits"))
-			Expect(err).NotTo(HaveOccurred())
-
-			// Reconcile 2: Pending -> sets StartedAt, transitions to Preparing.
-			_, err = reconciler.Reconcile(ctx, req("timeout-no-commits"))
-			Expect(err).NotTo(HaveOccurred())
+			// Drive through finalizers and into Preparing.
+			reconcileToPhase(reconciler, "timeout-no-commits", backupv1alpha1.TransactionPhasePreparing)
 
 			// At this point StartedAt is set and 1ns timeout has already expired.
 			// Next reconcile should detect timeout. No items are committed.
-			_, err = reconciler.Reconcile(ctx, req("timeout-no-commits"))
+			_, err := reconciler.Reconcile(ctx, req("timeout-no-commits"))
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("timeout-no-commits"), txn)).To(Succeed())

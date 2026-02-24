@@ -101,6 +101,17 @@ type ResourceChangeList struct {
 	Items           []ResourceChange `json:"items"`
 }
 
+// Annotation keys for Transaction deletion behavior.
+const (
+	// AnnotationAutoRollback controls automatic rollback retry on deletion.
+	// Present by default (added at seal time). Remove to stop retrying.
+	AnnotationAutoRollback = "tx.janus.io/automatic-rollback"
+
+	// AnnotationRetryRollback is a one-shot trigger for manual rollback retry.
+	// User adds it; controller removes it after the attempt.
+	AnnotationRetryRollback = "tx.janus.io/retry-rollback"
+)
+
 // TransactionSpec defines the desired state of a Transaction.
 type TransactionSpec struct {
 	// ServiceAccountName is the SA whose identity is used for resource operations.
