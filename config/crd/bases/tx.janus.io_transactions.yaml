@@ -18,6 +18,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .spec.sealed
+      name: Sealed
+      type: boolean
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -48,62 +51,17 @@ spec:
           spec:
             description: TransactionSpec defines the desired state of a Transaction.
             properties:
-              changes:
-                description: Changes is the ordered list of resource mutations to
-                  apply atomically.
-                items:
-                  description: ResourceChange describes a single mutation within a
-                    transaction.
-                  properties:
-                    content:
-                      description: |-
-                        Content holds the resource manifest or patch data.
-                        Required for Create, Update, and Patch. Ignored for Delete.
-                      type: object
-                      x-kubernetes-preserve-unknown-fields: true
-                    target:
-                      description: Target identifies the resource to mutate.
-                      properties:
-                        apiVersion:
-                          description: APIVersion is the group/version of the target
-                            resource (e.g. "v1", "apps/v1").
-                          type: string
-                        kind:
-                          description: Kind is the resource kind (e.g. "ConfigMap",
-                            "Deployment").
-                          type: string
-                        name:
-                          description: Name of the target resource.
-                          type: string
-                        namespace:
-                          description: Namespace of the target resource. Defaults
-                            to the Transaction's namespace if empty.
-                          type: string
-                      required:
-                      - apiVersion
-                      - kind
-                      - name
-                      type: object
-                    type:
-                      description: 'Type is the kind of mutation: Create, Update,
-                        Patch, or Delete.'
-                      enum:
-                      - Create
-                      - Update
-                      - Patch
-                      - Delete
-                      type: string
-                  required:
-                  - target
-                  - type
-                  type: object
-                minItems: 1
-                type: array
               lockTimeout:
                 description: |-
                   LockTimeout is how long acquired locks are held before expiring.
                   Defaults to 5 minutes.
                 type: string
+              sealed:
+                description: |-
+                  Sealed indicates the transaction is ready for processing.
+                  The controller ignores unsealed transactions.
+                  Once sealed, this field is immutable.
+                type: boolean
               serviceAccountName:
                 description: |-
                   ServiceAccountName is the SA whose identity is used for resource operations.
@@ -118,7 +76,6 @@ spec:
                   Defaults to 30 minutes.
                 type: string
             required:
-            - changes
             - serviceAccountName
             type: object
           status:
@@ -187,8 +144,7 @@ spec:
                   type: object
                 type: array
               items:
-                description: Items tracks the per-resource state for each change in
-                  spec.changes.
+                description: Items tracks the per-resource state for each ResourceChange.
                 items:
                   description: ItemStatus tracks the state of a single resource change
                     within the transaction.
@@ -208,6 +164,10 @@ spec:
                       description: LockLease is the name of the Lease object used
                         to lock this resource.
                       type: string
+                    name:
+                      description: Name is the name of the ResourceChange CR this
+                        status tracks.
+                      type: string
                     prepared:
                       description: Prepared indicates whether the resource's prior
                         state has been captured.
@@ -223,10 +183,14 @@ spec:
                       type: boolean
                   required:
                   - committed
+                  - name
                   - prepared
                   - rolledBack
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               phase:
                 description: Phase is the current phase of the transaction state machine.
                 type: string

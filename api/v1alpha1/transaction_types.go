@@ -59,8 +59,8 @@ type ResourceRef struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
-// ResourceChange describes a single mutation within a transaction.
-type ResourceChange struct {
+// ResourceChangeSpec describes a single mutation within a transaction.
+type ResourceChangeSpec struct {
 	// Target identifies the resource to mutate.
 	Target ResourceRef `json:"target"`
 	// Type is the kind of mutation: Create, Update, Patch, or Delete.
@@ -69,6 +69,36 @@ type ResourceChange struct {
 	// Required for Create, Update, and Patch. Ignored for Delete.
 	// +optional
 	Content runtime.RawExtension `json:"content,omitempty"`
+	// Order controls execution sequence. Changes with the same order value
+	// are independent and may execute in parallel in future versions.
+	// Changes with lower order values execute first.
+	// +kubebuilder:default=0
+	// +optional
+	Order int32 `json:"order,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
+// +kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.spec.target.kind`
+// +kubebuilder:printcolumn:name="Order",type=integer,JSONPath=`.spec.order`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// ResourceChange represents a single resource mutation belonging to a Transaction.
+type ResourceChange struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec ResourceChangeSpec `json:"spec,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// ResourceChangeList contains a list of ResourceChanges.
+type ResourceChangeList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ResourceChange `json:"items"`
 }
 
 // TransactionSpec defines the desired state of a Transaction.
@@ -77,9 +107,11 @@ type TransactionSpec struct {
 	// Must exist in the Transaction's namespace.
 	// +kubebuilder:validation:MinLength=1
 	ServiceAccountName string `json:"serviceAccountName"`
-	// Changes is the ordered list of resource mutations to apply atomically.
-	// +kubebuilder:validation:MinItems=1
-	Changes []ResourceChange `json:"changes"`
+	// Sealed indicates the transaction is ready for processing.
+	// The controller ignores unsealed transactions.
+	// Once sealed, this field is immutable.
+	// +optional
+	Sealed bool `json:"sealed,omitempty"`
 	// LockTimeout is how long acquired locks are held before expiring.
 	// Defaults to 5 minutes.
 	// +optional
@@ -94,6 +126,8 @@ type TransactionSpec struct {
 
 // ItemStatus tracks the state of a single resource change within the transaction.
 type ItemStatus struct {
+	// Name is the name of the ResourceChange CR this status tracks.
+	Name string `json:"name"`
 	// LockLease is the name of the Lease object used to lock this resource.
 	// +optional
 	LockLease string `json:"lockLease,omitempty"`
@@ -122,8 +156,10 @@ type TransactionStatus struct {
 	Phase TransactionPhase `json:"phase,omitempty"`
 	// Version is incremented on each status update to detect stale writes.
 	Version int64 `json:"version"`
-	// Items tracks the per-resource state for each change in spec.changes.
+	// Items tracks the per-resource state for each ResourceChange.
 	// +optional
+	// +listType=map
+	// +listMapKey=name
 	Items []ItemStatus `json:"items,omitempty"`
 	// RollbackRef is the name of the ConfigMap storing rollback data.
 	// +optional
@@ -142,6 +178,7 @@ type TransactionStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Sealed",type=boolean,JSONPath=`.spec.sealed`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // Transaction represents an atomic set of Kubernetes resource mutations
@@ -165,4 +202,5 @@ type TransactionList struct {
 
 func init() {
 	SchemeBuilder.Register(&Transaction{}, &TransactionList{})
+	SchemeBuilder.Register(&ResourceChange{}, &ResourceChangeList{})
 }
