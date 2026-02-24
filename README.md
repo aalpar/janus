@@ -163,6 +163,33 @@ sequence can be rolled back on failure.
 └──────────────────────────────────────────────────────────┘
 ```
 
+### State machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+
+    Pending --> Preparing : init status + create rollback CM
+    Pending --> Failed : CM creation fails / SA missing
+
+    Preparing --> Prepared : all items locked + snapshotted
+    Preparing --> Failed : lock fail / read fail / SA missing / timeout (no commits)
+
+    Prepared --> Committing : immediate
+
+    Committing --> Committed : all items applied
+    Committing --> RollingBack : lock renewal fail / apply error / timeout (has commits)
+    Committing --> Failed : conflict detected / SA missing / timeout (no commits)
+
+    RollingBack --> RolledBack : all items reversed cleanly
+    RollingBack --> Failed : CM missing / timeout / conflicts remain
+
+    Failed --> RollingBack : recovery (has un-rolled commits + CM exists)
+
+    Committed --> [*]
+    RolledBack --> [*]
+```
+
 **Prepare phase** — For each resource: acquire a Lease lock, read current
 state into a rollback ConfigMap. This builds the compensating actions the
 Saga needs if it must abort.

@@ -4,5 +4,5 @@ resources:
 - manager.yaml
 images:
 - name: controller
-  newName: example.com/janus
-  newTag: v0.0.1
+  newName: janus-controller
+  newTag: latest
