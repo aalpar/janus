@@ -39,3 +39,6 @@ private/
 # Serena Files
 .serena/
 
+# Git worktrees
+.worktrees/
+
