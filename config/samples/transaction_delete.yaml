@@ -1,3 +1,5 @@
+# Delete an existing ConfigMap via Transaction.
+---
 apiVersion: tx.janus.io/v1alpha1
 kind: Transaction
 metadata:
@@ -5,10 +7,22 @@ metadata:
   namespace: default
 spec:
   serviceAccountName: janus-txn
-  changes:
-    - target:
-        apiVersion: v1
-        kind: ConfigMap
-        name: stale-config
-        namespace: default
-      type: Delete
+  sealed: true
+---
+apiVersion: tx.janus.io/v1alpha1
+kind: ResourceChange
+metadata:
+  name: delete-configmap-txn-delete-config
+  namespace: default
+  ownerReferences:
+    - apiVersion: tx.janus.io/v1alpha1
+      kind: Transaction
+      name: delete-configmap-txn
+      uid: FILL-IN-AFTER-TRANSACTION-CREATION
+spec:
+  target:
+    apiVersion: v1
+    kind: ConfigMap
+    name: stale-config
+    namespace: default
+  type: Delete

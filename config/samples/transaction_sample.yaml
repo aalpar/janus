@@ -1,3 +1,14 @@
+# Sample multi-resource Transaction.
+#
+# Workflow:
+#   1. Create the Transaction (unsealed).
+#   2. Create ResourceChange CRs with ownerReferences pointing at the Transaction.
+#   3. Seal the Transaction to trigger processing.
+#
+# The CLI (janus create / janus add / janus seal) handles this automatically.
+# To apply manually, create the Transaction first, then fill in the UID in
+# each ResourceChange's ownerReferences before applying them.
+---
 apiVersion: tx.janus.io/v1alpha1
 kind: Transaction
 metadata:
@@ -6,43 +17,79 @@ metadata:
 spec:
   serviceAccountName: janus-txn
   lockTimeout: 5m
-  changes:
-    # 1. Update a ConfigMap
-    - target:
-        apiVersion: v1
-        kind: ConfigMap
-        name: app-config
-        namespace: default
-      type: Update
-      content:
-        apiVersion: v1
-        kind: ConfigMap
-        metadata:
-          name: app-config
-          namespace: default
-        data:
-          database_url: "postgres://db:5432/myapp"
-          log_level: "info"
-
-    # 2. Patch a Deployment image
-    - target:
-        apiVersion: apps/v1
-        kind: Deployment
-        name: web-server
-        namespace: default
-      type: Patch
-      content:
+  sealed: true
+---
+# 1. Update a ConfigMap
+apiVersion: tx.janus.io/v1alpha1
+kind: ResourceChange
+metadata:
+  name: multi-resource-txn-update-config
+  namespace: default
+  ownerReferences:
+    - apiVersion: tx.janus.io/v1alpha1
+      kind: Transaction
+      name: multi-resource-txn
+      uid: FILL-IN-AFTER-TRANSACTION-CREATION
+spec:
+  target:
+    apiVersion: v1
+    kind: ConfigMap
+    name: app-config
+    namespace: default
+  type: Update
+  content:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: app-config
+      namespace: default
+    data:
+      database_url: "postgres://db:5432/myapp"
+      log_level: "info"
+---
+# 2. Patch a Deployment image
+apiVersion: tx.janus.io/v1alpha1
+kind: ResourceChange
+metadata:
+  name: multi-resource-txn-patch-deploy
+  namespace: default
+  ownerReferences:
+    - apiVersion: tx.janus.io/v1alpha1
+      kind: Transaction
+      name: multi-resource-txn
+      uid: FILL-IN-AFTER-TRANSACTION-CREATION
+spec:
+  target:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-server
+    namespace: default
+  type: Patch
+  order: 1
+  content:
+    spec:
+      template:
         spec:
-          template:
-            spec:
-              containers:
-                - name: web
-                  image: myapp:v2.1.0
-
-    # 3. Delete a stale Secret
-    - target:
-        apiVersion: v1
-        kind: Secret
-        name: old-api-key
-        namespace: default
-      type: Delete
+          containers:
+            - name: web
+              image: myapp:v2.1.0
+---
+# 3. Delete a stale Secret
+apiVersion: tx.janus.io/v1alpha1
+kind: ResourceChange
+metadata:
+  name: multi-resource-txn-delete-secret
+  namespace: default
+  ownerReferences:
+    - apiVersion: tx.janus.io/v1alpha1
+      kind: Transaction
+      name: multi-resource-txn
+      uid: FILL-IN-AFTER-TRANSACTION-CREATION
+spec:
+  target:
+    apiVersion: v1
+    kind: Secret
+    name: old-api-key
+    namespace: default
+  type: Delete
+  order: 2

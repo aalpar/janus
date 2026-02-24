@@ -285,10 +285,10 @@ subjects:
 
 		It("should create a ConfigMap via Transaction", func() {
 			txnName := "e2e-create"
-			Expect(kubectlApplyInput(transactionYAML(txnName, txnChange{
+			createTransactionWithChanges(txnName, txnChange{
 				Kind: "ConfigMap", Name: "created-cm", ChangeType: "Create",
 				Content: configMapYAML("created-cm", "key1: val1"),
-			}))).To(Succeed())
+			})
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
@@ -305,10 +305,10 @@ subjects:
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "patch-target", testNS)
 
 			txnName := "e2e-patch"
-			Expect(kubectlApplyInput(transactionYAML(txnName, txnChange{
+			createTransactionWithChanges(txnName, txnChange{
 				Kind: "ConfigMap", Name: "patch-target", ChangeType: "Patch",
 				Content: "data:\n  added: new-value",
-			}))).To(Succeed())
+			})
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
@@ -329,9 +329,9 @@ subjects:
 			applyConfigMap("delete-target", `doomed: "true"`)
 
 			txnName := "e2e-delete"
-			Expect(kubectlApplyInput(transactionYAML(txnName, txnChange{
+			createTransactionWithChanges(txnName, txnChange{
 				Kind: "ConfigMap", Name: "delete-target", ChangeType: "Delete",
-			}))).To(Succeed())
+			})
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
@@ -347,7 +347,7 @@ subjects:
 			applyConfigMap("multi-delete-target", `ephemeral: "true"`)
 
 			txnName := "e2e-multi"
-			Expect(kubectlApplyInput(transactionYAML(txnName,
+			createTransactionWithChanges(txnName,
 				txnChange{
 					Kind: "ConfigMap", Name: "multi-create-cm", ChangeType: "Create",
 					Content: configMapYAML("multi-create-cm", `created: "true"`),
@@ -359,7 +359,7 @@ subjects:
 				txnChange{
 					Kind: "ConfigMap", Name: "multi-delete-target", ChangeType: "Delete",
 				},
-			))).To(Succeed())
+			)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "multi-create-cm", testNS)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "multi-patch-target", testNS)
@@ -387,7 +387,7 @@ subjects:
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "rollback-patch-target", testNS)
 
 			txnName := "e2e-rollback"
-			Expect(kubectlApplyInput(transactionYAML(txnName,
+			createTransactionWithChanges(txnName,
 				txnChange{
 					Kind: "ConfigMap", Name: "rollback-patch-target", ChangeType: "Patch",
 					Content: "data:\n  patched: \"yes\"",
@@ -406,7 +406,7 @@ metadata:
 stringData:
   secret-key: secret-val`, testNS),
 				},
-			))).To(Succeed())
+			)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "RolledBack")
@@ -431,10 +431,10 @@ stringData:
 
 		It("should fail when referencing a non-existent ServiceAccount", func() {
 			txnName := "e2e-bad-sa"
-			Expect(kubectlApplyInput(transactionYAMLWithSA(txnName, "does-not-exist", txnChange{
+			createTransactionWithSA(txnName, "does-not-exist", txnChange{
 				Kind: "ConfigMap", Name: "irrelevant", ChangeType: "Create",
 				Content: configMapYAML("irrelevant", "key: val"),
-			}))).To(Succeed())
+			})
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Failed")
@@ -539,43 +539,70 @@ type txnChange struct {
 	Content    string // raw YAML indented under content:; empty for Delete
 }
 
-// transactionYAML builds Transaction YAML in testNS using testSA.
-func transactionYAML(name string, changes ...txnChange) string {
-	return transactionYAMLWithSA(name, testSA, changes...)
+// createTransactionWithChanges creates a Transaction + ResourceChange CRs and seals it.
+// This is the standard e2e workflow: create → add changes → seal.
+func createTransactionWithChanges(name string, changes ...txnChange) {
+	createTransactionWithSA(name, testSA, changes...)
 }
 
-// transactionYAMLWithSA builds Transaction YAML with a custom ServiceAccount.
-func transactionYAMLWithSA(name, sa string, changes ...txnChange) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, `apiVersion: tx.janus.io/v1alpha1
+// createTransactionWithSA creates a Transaction with a custom ServiceAccount,
+// adds ResourceChange CRs with proper OwnerReferences, then seals the Transaction.
+func createTransactionWithSA(name, sa string, changes ...txnChange) {
+	// 1. Create unsealed Transaction.
+	txnYAML := fmt.Sprintf(`apiVersion: tx.janus.io/v1alpha1
 kind: Transaction
 metadata:
   name: %s
   namespace: %s
 spec:
   serviceAccountName: %s
-  changes:
 `, name, testNS, sa)
-	for _, c := range changes {
-		fmt.Fprintf(&b, `  - target:
-      apiVersion: v1
-      kind: %s
+	ExpectWithOffset(1, kubectlApplyInput(txnYAML)).To(Succeed())
+
+	// 2. Read back the UID.
+	uid, err := kubectlGetField("transaction", name, testNS, "{.metadata.uid}")
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	ExpectWithOffset(1, uid).NotTo(BeEmpty())
+
+	// 3. Create ResourceChange CRs with OwnerRef.
+	for i, c := range changes {
+		rcName := fmt.Sprintf("%s-change-%d", name, i)
+		var b strings.Builder
+		fmt.Fprintf(&b, `apiVersion: tx.janus.io/v1alpha1
+kind: ResourceChange
+metadata:
+  name: %s
+  namespace: %s
+  ownerReferences:
+    - apiVersion: tx.janus.io/v1alpha1
+      kind: Transaction
       name: %s
-      namespace: %s
-    type: %s
-`, c.Kind, c.Name, testNS, c.ChangeType)
+      uid: %s
+spec:
+  target:
+    apiVersion: v1
+    kind: %s
+    name: %s
+    namespace: %s
+  type: %s
+`, rcName, testNS, name, uid, c.Kind, c.Name, testNS, c.ChangeType)
 		if c.Content != "" {
-			b.WriteString("    content:\n")
+			b.WriteString("  content:\n")
 			for _, line := range strings.Split(c.Content, "\n") {
 				if line == "" {
 					b.WriteString("\n")
 				} else {
-					fmt.Fprintf(&b, "      %s\n", line)
+					fmt.Fprintf(&b, "    %s\n", line)
 				}
 			}
 		}
+		ExpectWithOffset(1, kubectlApplyInput(b.String())).To(Succeed())
 	}
-	return b.String()
+
+	// 4. Seal the Transaction.
+	_, err = kubectl("patch", "transaction", name, "-n", testNS,
+		"--type=merge", "-p", `{"spec":{"sealed":true}}`)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
 }
 
 // configMapYAML returns full ConfigMap YAML for testNS.

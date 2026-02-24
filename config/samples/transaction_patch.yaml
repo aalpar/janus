@@ -1,3 +1,6 @@
+# Patch an existing ConfigMap using server-side apply.
+# Only the fields specified in content are merged; existing keys are preserved.
+---
 apiVersion: tx.janus.io/v1alpha1
 kind: Transaction
 metadata:
@@ -5,16 +8,26 @@ metadata:
   namespace: default
 spec:
   serviceAccountName: janus-txn
-  changes:
-    # Patches an existing ConfigMap using server-side apply.
-    # Only the fields specified in content are merged; existing keys are preserved.
-    - target:
-        apiVersion: v1
-        kind: ConfigMap
-        name: app-config
-        namespace: default
-      type: Patch
-      content:
-        data:
-          log_level: "debug"
-          feature_flag: "enabled"
+  sealed: true
+---
+apiVersion: tx.janus.io/v1alpha1
+kind: ResourceChange
+metadata:
+  name: patch-configmap-txn-patch-config
+  namespace: default
+  ownerReferences:
+    - apiVersion: tx.janus.io/v1alpha1
+      kind: Transaction
+      name: patch-configmap-txn
+      uid: FILL-IN-AFTER-TRANSACTION-CREATION
+spec:
+  target:
+    apiVersion: v1
+    kind: ConfigMap
+    name: app-config
+    namespace: default
+  type: Patch
+  content:
+    data:
+      log_level: "debug"
+      feature_flag: "enabled"
