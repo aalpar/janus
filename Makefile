@@ -92,6 +92,15 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 test-e2e-k0s: manifests generate fmt vet ## Run e2e tests against an existing k0s cluster.
 	E2E_CLUSTER_PROVIDER=k0s go test -tags=e2e -timeout 30m ./test/e2e/ -v -ginkgo.v
 
+.PHONY: clean
+clean: ## Remove all generated files and build artifacts.
+	rm -f api/v1alpha1/zz_generated.deepcopy.go
+	rm -f config/crd/bases/*.yaml
+	rm -f config/rbac/role.yaml
+	rm -f config/webhook/manifests.yaml
+	rm -rf $(LOCALBIN)
+	rm -f cover.out
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

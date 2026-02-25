@@ -23,5 +23,18 @@ rules:
   - tx.janus.io
   resources:
   - transactions/status
+  - resourcechanges/status
   verbs:
   - get
+- apiGroups:
+  - tx.janus.io
+  resources:
+  - resourcechanges
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
