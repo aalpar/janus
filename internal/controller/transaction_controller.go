@@ -457,7 +457,41 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 		item.LeaseNamespace = ns
 
 		// Read current state and store in rollback ConfigMap.
-		if change.Type != backupv1alpha1.ChangeTypeCreate {
+		if change.Type == backupv1alpha1.ChangeTypeCreate {
+			// Create uses SSA — resource may or may not exist.
+			obj, err := r.getResource(ctx, userClient, change.Target, ns)
+			if err != nil && !apierrors.IsNotFound(err) {
+				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
+				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: reading current state: %v", rc.Name, err))
+			}
+			if apierrors.IsNotFound(err) {
+				// Resource doesn't exist — rollback will delete.
+				env := rollback.Envelope{ChangeType: string(change.Type)}
+				envData, mErr := json.Marshal(env)
+				if mErr != nil {
+					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: serializing create envelope: %v", rc.Name, mErr))
+				}
+				cm := &corev1.ConfigMap{}
+				if gErr := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); gErr != nil {
+					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: fetching rollback ConfigMap: %v", rc.Name, gErr))
+				}
+				if cm.Data == nil {
+					cm.Data = make(map[string]string)
+				}
+				rbKey := rollback.Key(change.Target.Kind, ns, change.Target.Name)
+				cm.Data[rbKey] = string(envData)
+				if uErr := r.Update(ctx, cm); uErr != nil {
+					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving create envelope: %v", rc.Name, uErr))
+				}
+			} else {
+				// Resource exists — save prior state so rollback restores it.
+				item.ResourceVersion = obj.GetResourceVersion()
+				if err := r.saveRollbackState(ctx, txn, change, obj); err != nil {
+					txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
+					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving rollback state: %v", rc.Name, err))
+				}
+			}
+		} else {
 			obj, err := r.getResource(ctx, userClient, change.Target, ns)
 			if err != nil {
 				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
@@ -467,26 +501,6 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 			if err := r.saveRollbackState(ctx, txn, change, obj); err != nil {
 				txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
 				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving rollback state: %v", rc.Name, err))
-			}
-		} else {
-			// Create changes have no prior state, but store an envelope so the
-			// CLI knows rollback = delete.
-			env := rollback.Envelope{ChangeType: string(change.Type)}
-			envData, err := json.Marshal(env)
-			if err != nil {
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: serializing create envelope: %v", rc.Name, err))
-			}
-			cm := &corev1.ConfigMap{}
-			if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); err != nil {
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: fetching rollback ConfigMap: %v", rc.Name, err))
-			}
-			if cm.Data == nil {
-				cm.Data = make(map[string]string)
-			}
-			rbKey := rollback.Key(change.Target.Kind, ns, change.Target.Name)
-			cm.Data[rbKey] = string(envData)
-			if err := r.Update(ctx, cm); err != nil {
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving create envelope: %v", rc.Name, err))
 			}
 		}
 
@@ -717,7 +731,7 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 func (r *TransactionReconciler) checkConflict(ctx context.Context, cl client.Client,
 	change backupv1alpha1.ResourceChangeSpec, ns string, expectedRV string) error {
 
-	if change.Type == backupv1alpha1.ChangeTypeCreate || expectedRV == "" {
+	if expectedRV == "" {
 		return nil
 	}
 
@@ -767,18 +781,23 @@ func (r *TransactionReconciler) getResource(ctx context.Context, cl client.Clien
 func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChangeSpec, namespace, txnName, storedRV string) error {
 	switch change.Type {
 	case backupv1alpha1.ChangeTypeCreate:
+		// Server-side apply: creates the resource if it doesn't exist,
+		// merges owned fields if it does (idempotent, like kubectl apply).
 		obj, err := r.unmarshalContent(change.Content, change.Target)
 		if err != nil {
 			return err
 		}
+		obj.SetName(change.Target.Name)
 		obj.SetNamespace(namespace)
-		if err := cl.Create(ctx, obj); err != nil {
-			if apierrors.IsAlreadyExists(err) {
-				return nil // Already created by a previous attempt.
-			}
-			return err
+		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
+		if err != nil {
+			return &ResourceOpError{Op: "parsing apiVersion for create", Ref: change.Target.APIVersion, Err: err}
 		}
-		return nil
+		obj.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
+		})
+		ac := client.ApplyConfigurationFromUnstructured(obj)
+		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
 
 	case backupv1alpha1.ChangeTypeUpdate:
 		obj, err := r.unmarshalContent(change.Content, change.Target)
@@ -847,15 +866,41 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 	switch change.Type {
 	case backupv1alpha1.ChangeTypeCreate:
-		// Reverse of Create = Delete.
-		existing, err := r.getResource(ctx, cl, change.Target, namespace)
+		// If the resource didn't exist before, reverse = delete.
+		// If it existed, reverse = SSA-apply prior values (like Patch rollback).
+		obj, _, err := loadRollbackState(rbCM, rbKey, namespace)
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
 			return err
 		}
-		return cl.Delete(ctx, existing)
+		if obj == nil {
+			// Fresh create — delete to reverse.
+			existing, err := r.getResource(ctx, cl, change.Target, namespace)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+			return cl.Delete(ctx, existing)
+		}
+		// Resource existed before — restore prior field values via SSA.
+		var contentMap map[string]any
+		if err := json.Unmarshal(change.Content.Raw, &contentMap); err != nil {
+			return &ResourceOpError{Op: "unmarshaling create content for reverse", Err: err}
+		}
+		reversePatch := computeReversePatch(contentMap, obj.Object)
+		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
+		if err != nil {
+			return &ResourceOpError{Op: "parsing apiVersion for rollback create", Ref: change.Target.APIVersion, Err: err}
+		}
+		patchObj := &unstructured.Unstructured{Object: reversePatch}
+		patchObj.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
+		})
+		patchObj.SetName(change.Target.Name)
+		patchObj.SetNamespace(namespace)
+		ac := client.ApplyConfigurationFromUnstructured(patchObj)
+		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
 
 	case backupv1alpha1.ChangeTypeDelete:
 		// Reverse of Delete = re-Create from rollback state.

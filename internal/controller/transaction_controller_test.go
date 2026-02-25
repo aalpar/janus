@@ -1473,8 +1473,8 @@ var _ = Describe("Transaction Controller", func() {
 		})
 	})
 
-	Context("idempotent commit Create", func() {
-		It("should succeed when resource already exists from a previous attempt", func() {
+	Context("Create with SSA (idempotent)", func() {
+		It("should merge via SSA when resource already exists", func() {
 			cmContent := map[string]any{
 				"apiVersion": "v1",
 				"kind":       "ConfigMap",
@@ -1506,25 +1506,109 @@ var _ = Describe("Transaction Controller", func() {
 			}, txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
-			// Progress to Committing.
-			reconcileToPhase(reconciler, "idemp-create-txn", backupv1alpha1.TransactionPhaseCommitting)
-
-			// Pre-create the ConfigMap to simulate crash-after-create-before-status-update.
+			// Pre-create the ConfigMap — simulates the resource existing before
+			// the transaction. Prepare should capture prior state.
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "idemp-create-cm",
 					Namespace: testNamespace,
 				},
-				Data: map[string]string{"k": "v"},
+				Data: map[string]string{"existing": "data"},
 			}
 			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
 
-			// Reconcile: should not fail despite AlreadyExists.
+			// Progress to Committing (prepare captures existing CM state).
+			reconcileToPhase(reconciler, "idemp-create-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Verify prepare captured a ResourceVersion (resource existed).
+			Expect(k8sClient.Get(ctx, nn("idemp-create-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].ResourceVersion).NotTo(BeEmpty())
+
+			// Commit via SSA — should merge, not fail.
 			_, err := reconciler.Reconcile(ctx, req("idemp-create-txn"))
 			Expect(err).NotTo(HaveOccurred())
 
-			// Should progress to Committed.
 			reconcileToPhase(reconciler, "idemp-create-txn", backupv1alpha1.TransactionPhaseCommitted)
+
+			// Verify the CM has both old and new data.
+			Expect(k8sClient.Get(ctx, nn("idemp-create-cm"), cm)).To(Succeed())
+			Expect(cm.Data["k"]).To(Equal("v"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("should rollback Create-over-existing by restoring prior state via SSA", func() {
+			// Pre-create a ConfigMap with original data.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-create-exist-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"original": "value"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			createContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "rb-create-exist-cm", "namespace": testNamespace},
+				"data":       map[string]any{"original": "overwritten"},
+			}
+			createRaw, _ := json.Marshal(createContent)
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-create-exist-txn",
+					Namespace: testNamespace,
+				},
+				Spec: backupv1alpha1.TransactionSpec{
+					ServiceAccountName: testSAName,
+					Sealed:             true,
+				},
+			}
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("rb-create-exist-txn", "rb-create-exist-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-create-exist-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: createRaw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+			blocker := blockerChange("rb-create-exist-txn", "rb-create-exist-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
+
+			// Use real lock manager through prepare and first commit.
+			realLockMgr := &lock.LeaseManager{Client: k8sClient}
+			reconciler.LockMgr = realLockMgr
+
+			// Reconcile to Committing (prepare captures existing CM).
+			reconcileToPhase(reconciler, "rb-create-exist-txn", backupv1alpha1.TransactionPhaseCommitting)
+
+			// Commit item 0 (Create via SSA — overwrites "original" → "overwritten").
+			_, err := reconciler.Reconcile(ctx, req("rb-create-exist-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("rb-create-exist-cm"), cm)).To(Succeed())
+			Expect(cm.Data["original"]).To(Equal("overwritten"))
+
+			// Fail item 1's lock check to trigger rollback.
+			reconciler.LockMgr = failingRenewLockMgr()
+
+			// Committing → RollingBack.
+			_, err = reconciler.Reconcile(ctx, req("rb-create-exist-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// RollingBack → RolledBack (restores prior state via reverse SSA).
+			reconcileToPhase(reconciler, "rb-create-exist-txn", backupv1alpha1.TransactionPhaseRolledBack)
+
+			// Verify the CM was restored to its original data.
+			Expect(k8sClient.Get(ctx, nn("rb-create-exist-cm"), cm)).To(Succeed())
+			Expect(cm.Data["original"]).To(Equal("value"))
 
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
@@ -2039,14 +2123,13 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
 			// Reconcile to terminal state — the SA has no RBAC so the
-			// commit fails with 403 and triggers rollback. Since the Create
-			// was never applied, rollback succeeds → RolledBack.
-			reconcileToPhase(reconciler, "unpriv-sa-txn", backupv1alpha1.TransactionPhaseRolledBack)
+			// prepare phase fails with 403 when trying to read the target
+			// resource (Create now checks for existing state). Since nothing
+			// was committed, the transaction goes directly to Failed.
+			reconcileToPhase(reconciler, "unpriv-sa-txn", backupv1alpha1.TransactionPhaseFailed)
 
 			Expect(k8sClient.Get(ctx, nn("unpriv-sa-txn"), txn)).To(Succeed())
-			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
-			Expect(txn.Status.Items).NotTo(BeEmpty())
-			Expect(txn.Status.Items[0].Error).To(ContainSubstring("forbidden"))
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
 		})
 	})
 

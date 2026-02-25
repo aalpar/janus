@@ -20,7 +20,8 @@ type Envelope struct {
 	// ChangeType that produced this envelope (Create, Patch, Delete, Update).
 	ChangeType string `json:"changeType"`
 	// PriorState is the raw JSON of the resource before the change.
-	// Nil for Create (there was no prior state).
+	// Nil for Create when the resource did not exist (rollback = delete).
+	// Present for Create when the resource existed (rollback = restore via SSA).
 	PriorState json.RawMessage `json:"priorState,omitempty"`
 }
 

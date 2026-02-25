@@ -1,0 +1,72 @@
+# Demo staging: creates the pre-existing resources that the transaction
+# script (demo_nginx_txn.sh) will modify.
+#
+# What this creates:
+#   - ServiceAccount + RoleBinding (RBAC for Janus)
+#   - PersistentVolumeClaim "nginx-data" (5Gi)
+#   - Deployment "nginx" (1 replica, nginx:1.26, no volume mount)
+#
+# What this does NOT create:
+#   - Service "nginx" — the transaction Creates it via SSA (idempotent
+#     if it already exists with matching values)
+#
+# Usage:
+#   kubectl apply -f demo_nginx_setup.yaml
+#
+# StorageClass note: PVC resize requires allowVolumeExpansion: true on the
+# StorageClass. Most default StorageClasses in Kind/minikube support this.
+# If yours doesn't, the PVC patch will fail — which itself demonstrates
+# rollback behavior.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: janus-txn
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: janus-txn-edit
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+subjects:
+- kind: ServiceAccount
+  name: janus-txn
+  namespace: default
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-data
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.26
+          ports:
+            - containerPort: 80
