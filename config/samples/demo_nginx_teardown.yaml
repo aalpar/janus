@@ -1,0 +1,41 @@
+# Demo teardown: removes all objects created by demo_nginx_setup.yaml
+# and demo_nginx_txn.sh.
+#
+# Usage:
+#   kubectl delete -f demo_nginx_teardown.yaml --ignore-not-found
+---
+apiVersion: tx.janus.io/v1alpha1
+kind: Transaction
+metadata:
+  name: nginx-patch
+  namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: default
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-data
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: janus-txn-edit
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: janus-txn
+  namespace: default
