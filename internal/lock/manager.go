@@ -91,8 +91,6 @@ func setLeaseTime(lease *coordinationv1.Lease, timeout time.Duration) metav1.Mic
 }
 
 func (m *LeaseManager) createLease(ctx context.Context, key ResourceKey, name, txnName string, timeout time.Duration) (string, error) {
-	now := metav1.NewMicroTime(time.Now())
-	durationSec := int32(timeout.Seconds())
 	lease := &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -103,12 +101,11 @@ func (m *LeaseManager) createLease(ctx context.Context, key ResourceKey, name, t
 			},
 		},
 		Spec: coordinationv1.LeaseSpec{
-			HolderIdentity:       &txnName,
-			LeaseDurationSeconds: &durationSec,
-			AcquireTime:          &now,
-			RenewTime:            &now,
+			HolderIdentity: &txnName,
 		},
 	}
+	now := setLeaseTime(lease, timeout)
+	lease.Spec.AcquireTime = &now
 	if err := m.Client.Create(ctx, lease); err != nil {
 		return "", &LeaseOpError{Op: "creating", LeaseName: name, Err: err}
 	}
@@ -140,7 +137,7 @@ func (m *LeaseManager) Acquire(ctx context.Context, key ResourceKey, txnName str
 	}
 
 	// Held by a different transaction — check expiry.
-	if !m.isExpired(lease) {
+	if !isExpired(lease) {
 		return "", &ErrAlreadyLocked{LeaseName: name, Holder: holder}
 	}
 
@@ -194,7 +191,7 @@ func (m *LeaseManager) Renew(ctx context.Context, lease LeaseRef, txnName string
 	if holder := holderOf(existing); holder != txnName {
 		return &ErrAlreadyLocked{LeaseName: lease.Name, Holder: holder}
 	}
-	if m.isExpired(existing) {
+	if isExpired(existing) {
 		return &ErrLockExpired{LeaseName: lease.Name}
 	}
 
@@ -205,7 +202,7 @@ func (m *LeaseManager) Renew(ctx context.Context, lease LeaseRef, txnName string
 	return nil
 }
 
-func (m *LeaseManager) isExpired(lease *coordinationv1.Lease) bool {
+func isExpired(lease *coordinationv1.Lease) bool {
 	if lease.Spec.RenewTime == nil || lease.Spec.LeaseDurationSeconds == nil {
 		return true
 	}

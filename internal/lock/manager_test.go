@@ -573,7 +573,6 @@ func TestRenew_GetError(t *testing.T) {
 // --- isExpired ---
 
 func TestIsExpired_NilRenewTime(t *testing.T) {
-	m := &LeaseManager{}
 	dur := int32(300)
 	lease := &coordinationv1.Lease{
 		Spec: coordinationv1.LeaseSpec{
@@ -581,13 +580,12 @@ func TestIsExpired_NilRenewTime(t *testing.T) {
 			RenewTime:            nil,
 		},
 	}
-	if !m.isExpired(lease) {
+	if !isExpired(lease) {
 		t.Fatal("expected expired when RenewTime is nil")
 	}
 }
 
 func TestIsExpired_NilDuration(t *testing.T) {
-	m := &LeaseManager{}
 	now := metav1.NewMicroTime(time.Now())
 	lease := &coordinationv1.Lease{
 		Spec: coordinationv1.LeaseSpec{
@@ -595,13 +593,12 @@ func TestIsExpired_NilDuration(t *testing.T) {
 			RenewTime:            &now,
 		},
 	}
-	if !m.isExpired(lease) {
+	if !isExpired(lease) {
 		t.Fatal("expected expired when LeaseDurationSeconds is nil")
 	}
 }
 
 func TestIsExpired_NotExpired(t *testing.T) {
-	m := &LeaseManager{}
 	dur := int32(3600)
 	now := metav1.NewMicroTime(time.Now())
 	lease := &coordinationv1.Lease{
@@ -610,13 +607,12 @@ func TestIsExpired_NotExpired(t *testing.T) {
 			RenewTime:            &now,
 		},
 	}
-	if m.isExpired(lease) {
+	if isExpired(lease) {
 		t.Fatal("expected not expired")
 	}
 }
 
 func TestIsExpired_Expired(t *testing.T) {
-	m := &LeaseManager{}
 	dur := int32(1)
 	past := metav1.NewMicroTime(time.Now().Add(-10 * time.Second))
 	lease := &coordinationv1.Lease{
@@ -625,7 +621,7 @@ func TestIsExpired_Expired(t *testing.T) {
 			RenewTime:            &past,
 		},
 	}
-	if !m.isExpired(lease) {
+	if !isExpired(lease) {
 		t.Fatal("expected expired")
 	}
 }
