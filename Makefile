@@ -98,7 +98,7 @@ clean: ## Remove all generated files and build artifacts.
 	rm -f config/crd/bases/*.yaml
 	rm -f config/rbac/role.yaml
 	rm -f config/webhook/manifests.yaml
-	rm -rf $(LOCALBIN)
+	chmod -R u+w $(LOCALBIN) 2>/dev/null; rm -rf $(LOCALBIN)
 	rm -f cover.out
 
 .PHONY: lint
