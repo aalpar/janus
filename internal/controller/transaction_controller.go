@@ -819,24 +819,13 @@ func (r *TransactionReconciler) getResource(ctx context.Context, cl client.Clien
 // (precondition) operations.
 func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Client, change backupv1alpha1.ResourceChangeSpec, namespace, txnName, storedRV string) error {
 	switch change.Type {
-	case backupv1alpha1.ChangeTypeCreate:
-		// Server-side apply: creates the resource if it doesn't exist,
-		// merges owned fields if it does (idempotent, like kubectl apply).
+	case backupv1alpha1.ChangeTypeCreate, backupv1alpha1.ChangeTypePatch:
+		// Server-side apply: creates or merges owned fields (idempotent).
 		obj, err := r.unmarshalContent(change.Content, change.Target)
 		if err != nil {
 			return err
 		}
-		obj.SetName(change.Target.Name)
-		obj.SetNamespace(namespace)
-		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
-		if err != nil {
-			return &ResourceOpError{Op: "parsing apiVersion for create", Ref: change.Target.APIVersion, Err: err}
-		}
-		obj.SetGroupVersionKind(schema.GroupVersionKind{
-			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
-		})
-		ac := client.ApplyConfigurationFromUnstructured(obj)
-		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
+		return r.ssaApply(ctx, cl, obj, change.Target, namespace, txnName)
 
 	case backupv1alpha1.ChangeTypeUpdate:
 		obj, err := r.unmarshalContent(change.Content, change.Target)
@@ -852,25 +841,6 @@ func (r *TransactionReconciler) applyChange(ctx context.Context, cl client.Clien
 			return err
 		}
 		return nil
-
-	case backupv1alpha1.ChangeTypePatch:
-		// Server-side apply: Janus owns only the fields specified in the patch.
-		// Other controllers (HPA, etc.) retain ownership of their fields.
-		obj, err := r.unmarshalContent(change.Content, change.Target)
-		if err != nil {
-			return err
-		}
-		obj.SetName(change.Target.Name)
-		obj.SetNamespace(namespace)
-		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
-		if err != nil {
-			return &ResourceOpError{Op: "parsing apiVersion for patch", Ref: change.Target.APIVersion, Err: err}
-		}
-		obj.SetGroupVersionKind(schema.GroupVersionKind{
-			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
-		})
-		ac := client.ApplyConfigurationFromUnstructured(obj)
-		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
 
 	case backupv1alpha1.ChangeTypeDelete:
 		existing, err := r.getResource(ctx, cl, change.Target, namespace)
@@ -931,40 +901,16 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 			return cl.Delete(ctx, existing)
 		}
 		// Resource existed before — restore prior field values via SSA.
-		// Check for external modifications since commit.
-		if storedRV != "" {
-			existing, err := r.getResource(ctx, cl, change.Target, namespace)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					return &ErrRollbackConflict{Ref: change.Target, StoredRV: storedRV}
-				}
-				return err
-			}
-			if existing.GetResourceVersion() != storedRV {
-				return &ErrRollbackConflict{
-					Ref:       change.Target,
-					StoredRV:  storedRV,
-					CurrentRV: existing.GetResourceVersion(),
-				}
-			}
+		if err := r.checkRollbackRV(ctx, cl, change.Target, namespace, storedRV); err != nil {
+			return err
 		}
 		var contentMap map[string]any
 		if err := json.Unmarshal(change.Content.Raw, &contentMap); err != nil {
 			return &ResourceOpError{Op: "unmarshaling create content for reverse", Err: err}
 		}
 		reversePatch := computeReversePatch(contentMap, obj.Object)
-		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
-		if err != nil {
-			return &ResourceOpError{Op: "parsing apiVersion for rollback create", Ref: change.Target.APIVersion, Err: err}
-		}
 		patchObj := &unstructured.Unstructured{Object: reversePatch}
-		patchObj.SetGroupVersionKind(schema.GroupVersionKind{
-			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
-		})
-		patchObj.SetName(change.Target.Name)
-		patchObj.SetNamespace(namespace)
-		ac := client.ApplyConfigurationFromUnstructured(patchObj)
-		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
+		return r.ssaApply(ctx, cl, patchObj, change.Target, namespace, txnName)
 
 	case backupv1alpha1.ChangeTypeDelete:
 		// Reverse of Delete = re-Create from rollback state.
@@ -988,21 +934,8 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 		}
 
 		// Check for external modifications since commit.
-		if storedRV != "" {
-			existing, err := r.getResource(ctx, cl, change.Target, namespace)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					return &ErrRollbackConflict{Ref: change.Target, StoredRV: storedRV}
-				}
-				return err
-			}
-			if existing.GetResourceVersion() != storedRV {
-				return &ErrRollbackConflict{
-					Ref:       change.Target,
-					StoredRV:  storedRV,
-					CurrentRV: existing.GetResourceVersion(),
-				}
-			}
+		if err := r.checkRollbackRV(ctx, cl, change.Target, namespace, storedRV); err != nil {
+			return err
 		}
 
 		// Parse the forward patch content to know which fields were touched.
@@ -1013,21 +946,8 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 		// Compute reverse: same field paths, prior values.
 		reversePatch := computeReversePatch(contentMap, obj.Object)
-
-		// SSA requires identity fields.
-		gv, err := schema.ParseGroupVersion(change.Target.APIVersion)
-		if err != nil {
-			return &ResourceOpError{Op: "parsing apiVersion for rollback patch", Ref: change.Target.APIVersion, Err: err}
-		}
 		patchObj := &unstructured.Unstructured{Object: reversePatch}
-		patchObj.SetGroupVersionKind(schema.GroupVersionKind{
-			Group: gv.Group, Version: gv.Version, Kind: change.Target.Kind,
-		})
-		patchObj.SetName(change.Target.Name)
-		patchObj.SetNamespace(namespace)
-
-		ac := client.ApplyConfigurationFromUnstructured(patchObj)
-		return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
+		return r.ssaApply(ctx, cl, patchObj, change.Target, namespace, txnName)
 
 	case backupv1alpha1.ChangeTypeUpdate:
 		// Reverse of Update = restore the full previous state.
@@ -1064,6 +984,53 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 	default:
 		return fmt.Errorf("%w for rollback: %s", errUnknownChangeType, change.Type)
 	}
+}
+
+// ssaApply performs a server-side apply for the given unstructured object,
+// setting the required identity fields (GVK, name, namespace) and using
+// "janus-<txnName>" as the field manager.
+func (r *TransactionReconciler) ssaApply(ctx context.Context, cl client.Client,
+	obj *unstructured.Unstructured, ref backupv1alpha1.ResourceRef,
+	namespace, txnName string) error {
+
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return &ResourceOpError{Op: "parsing apiVersion for apply", Ref: ref.APIVersion, Err: err}
+	}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: gv.Group, Version: gv.Version, Kind: ref.Kind,
+	})
+	obj.SetName(ref.Name)
+	obj.SetNamespace(namespace)
+	ac := client.ApplyConfigurationFromUnstructured(obj)
+	return cl.Apply(ctx, ac, client.FieldOwner("janus-"+txnName), client.ForceOwnership)
+}
+
+// checkRollbackRV fetches the target resource and compares its current
+// resourceVersion against storedRV. Returns ErrRollbackConflict if the
+// resource is gone or the RV differs; returns nil if storedRV is empty
+// (nothing to check) or the RV matches.
+func (r *TransactionReconciler) checkRollbackRV(ctx context.Context, cl client.Client,
+	ref backupv1alpha1.ResourceRef, namespace, storedRV string) error {
+
+	if storedRV == "" {
+		return nil
+	}
+	existing, err := r.getResource(ctx, cl, ref, namespace)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return &ErrRollbackConflict{Ref: ref, StoredRV: storedRV}
+		}
+		return err
+	}
+	if existing.GetResourceVersion() != storedRV {
+		return &ErrRollbackConflict{
+			Ref:       ref,
+			StoredRV:  storedRV,
+			CurrentRV: existing.GetResourceVersion(),
+		}
+	}
+	return nil
 }
 
 // updateRollbackRV reads the current resourceVersion of a committed resource
@@ -1257,7 +1224,7 @@ func (r *TransactionReconciler) updateStatusAndRequeue(ctx context.Context, txn 
 
 func (r *TransactionReconciler) setFailed(ctx context.Context, txn *backupv1alpha1.Transaction, message string) error {
 	log := logf.FromContext(ctx)
-	log.Error(fmt.Errorf("transaction failed"), message)
+	log.Info("transaction failed", "reason", message)
 
 	oldPhase := txn.Status.Phase
 	now := metav1.Now()
