@@ -213,6 +213,9 @@ func runAdd(args []string) int {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      rcName,
 			Namespace: *namespace,
+			Labels: map[string]string{
+				"tx.janus.io/transaction": txnName,
+			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: backupv1alpha1.GroupVersion.String(),
 				Kind:       "Transaction",
