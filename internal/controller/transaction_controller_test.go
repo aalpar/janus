@@ -2633,7 +2633,7 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
 
-		It("should fail the transaction when resource is modified between prepare and commit (Patch)", func() {
+		It("should commit Patch despite external modification (SSA is idempotent)", func() {
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "conflict-patch-cm",
@@ -2675,7 +2675,8 @@ var _ = Describe("Transaction Controller", func() {
 			cm.Data["key"] = "externally-modified"
 			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
 
-			// Reconcile through Committing — should detect conflict and fail.
+			// Reconcile through Committing — SSA Patch skips RV conflict check
+			// and succeeds via field ownership.
 			for range 10 {
 				Expect(k8sClient.Get(ctx, types.NamespacedName{
 					Name: "conflict-patch-txn", Namespace: testNamespace,
@@ -2694,19 +2695,7 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
 				Name: "conflict-patch-txn", Namespace: testNamespace,
 			}, txn)).To(Succeed())
-			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
-
-			// Verify the failure message mentions conflict.
-			var failedCondition *metav1.Condition
-			for i := range txn.Status.Conditions {
-				if txn.Status.Conditions[i].Type == "Failed" {
-					failedCondition = &txn.Status.Conditions[i]
-					break
-				}
-			}
-			Expect(failedCondition).NotTo(BeNil())
-			Expect(failedCondition.Message).To(ContainSubstring("conflict"))
-			Expect(failedCondition.Message).To(ContainSubstring("resourceVersion"))
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
 
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
@@ -2879,6 +2868,80 @@ var _ = Describe("Transaction Controller", func() {
 
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, extCM)).To(Succeed())
+		})
+	})
+
+	Context("crash-retry idempotency", func() {
+		It("should detect self-write on Update retry and continue instead of false-failing", func() {
+			// Create a ConfigMap to update.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "selfwrite-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			updatedContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "selfwrite-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "updated"},
+			}
+			raw, err := json.Marshal(updatedContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := minimalTxn("selfwrite-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("selfwrite-txn", "selfwrite-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "selfwrite-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+
+			// Reconcile through Prepared.
+			reconcileToPhase(reconciler, "selfwrite-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// Reconcile once to transition Prepared → Committing.
+			_, err = reconciler.Reconcile(ctx, req("selfwrite-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile again to actually commit item 0.
+			_, err = reconciler.Reconcile(ctx, req("selfwrite-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify the item was committed and updateRollbackRV ran.
+			Expect(k8sClient.Get(ctx, nn("selfwrite-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+
+			// Simulate crash: revert Committed flag while leaving the
+			// target resource and rollback ConfigMap as-is.
+			txn.Status.Items[0].Committed = false
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Retry reconcile — should detect self-write via rollback CM
+			// post-commit RV and continue to Committed, not fail.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, nn("selfwrite-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed {
+					break
+				}
+				_, err = reconciler.Reconcile(ctx, req("selfwrite-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(k8sClient.Get(ctx, nn("selfwrite-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
 	})
 

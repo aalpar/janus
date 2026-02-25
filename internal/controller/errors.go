@@ -26,6 +26,7 @@ import (
 // Sentinel errors for controller operations.
 var (
 	errUnknownChangeType = errors.New("unknown change type")
+	errSelfWrite         = errors.New("self-write detected")
 )
 
 // ResourceOpError wraps an error with resource operation context.

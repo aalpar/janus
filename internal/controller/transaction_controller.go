@@ -567,42 +567,56 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 			}
 		}
 
-		// Check for external modifications since prepare.
-		if err := r.checkConflict(ctx, userClient, change, ns, item.ResourceVersion); err != nil {
-			txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
-			log.Error(err, "conflict detected, failing transaction", "resourcechange", rc.Name)
-			r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
-				"%s: %s/%s was modified externally since prepare", rc.Name, change.Target.Kind, change.Target.Name)
-			return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+		// Conflict detection: only needed for Update/Delete (RV-based).
+		// SSA Create/Patch are idempotent — field ownership is the conflict mechanism.
+		selfWrite := false
+		if change.Type == backupv1alpha1.ChangeTypeUpdate || change.Type == backupv1alpha1.ChangeTypeDelete {
+			committedRV := r.readCommittedRV(ctx, txn, change, ns)
+			if err := r.checkConflict(ctx, userClient, change, ns, item.ResourceVersion, committedRV); err != nil {
+				if errors.Is(err, errSelfWrite) {
+					// Crash-retry: Janus already committed this item.
+					// Skip the apply — the resource already reflects our write.
+					selfWrite = true
+					log.Info("self-write detected (crash-retry), skipping apply", "resourcechange", rc.Name)
+				} else {
+					txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
+					log.Error(err, "conflict detected, failing transaction", "resourcechange", rc.Name)
+					r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
+						"%s: %s/%s was modified externally since prepare", rc.Name, change.Target.Kind, change.Target.Name)
+					return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+				}
+			}
 		}
 
-		if err := r.applyChange(ctx, userClient, change, ns, txn.Name, item.ResourceVersion); err != nil {
-			var conflictErr *ErrConflictDetected
-			if errors.As(err, &conflictErr) {
-				txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
-				log.Error(err, "conflict detected during apply, failing transaction", "resourcechange", rc.Name)
-				r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
-					"%s: %s/%s was modified externally", rc.Name, change.Target.Kind, change.Target.Name)
-				return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+		if !selfWrite {
+			if err := r.applyChange(ctx, userClient, change, ns, txn.Name, item.ResourceVersion); err != nil {
+				var conflictErr *ErrConflictDetected
+				if errors.As(err, &conflictErr) {
+					txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
+					log.Error(err, "conflict detected during apply, failing transaction", "resourcechange", rc.Name)
+					r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
+						"%s: %s/%s was modified externally", rc.Name, change.Target.Kind, change.Target.Name)
+					return ctrl.Result{}, r.setFailed(ctx, txn, err.Error())
+				}
+				txmetrics.ItemOperations.WithLabelValues("commit", "error").Inc()
+				item.Error = err.Error()
+				log.Error(err, "commit failed, initiating rollback", "resourcechange", rc.Name)
+				r.event(txn, corev1.EventTypeWarning, "CommitFailed", "%s: %s %s/%s failed: %v", rc.Name, change.Type, change.Target.Kind, change.Target.Name, err)
+				return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 			}
-			txmetrics.ItemOperations.WithLabelValues("commit", "error").Inc()
-			item.Error = err.Error()
-			log.Error(err, "commit failed, initiating rollback", "resourcechange", rc.Name)
-			r.event(txn, corev1.EventTypeWarning, "CommitFailed", "%s: %s %s/%s failed: %v", rc.Name, change.Type, change.Target.Kind, change.Target.Name, err)
-			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
+
+			// Update rollback envelope with post-commit RV so the rollback conflict
+			// check compares against the RV Janus wrote, not the pre-commit RV.
+			if change.Type != backupv1alpha1.ChangeTypeDelete {
+				if err := r.updateRollbackRV(ctx, txn, change, ns, userClient); err != nil {
+					log.Error(err, "failed to update rollback RV after commit", "resourcechange", rc.Name)
+					// Non-fatal: worst case rollback will detect a false conflict.
+				}
+			}
 		}
 
 		txmetrics.ItemOperations.WithLabelValues("commit", "success").Inc()
 		item.Committed = true
-
-		// Update rollback envelope with post-commit RV so the rollback conflict
-		// check compares against the RV Janus wrote, not the pre-commit RV.
-		if change.Type == backupv1alpha1.ChangeTypeUpdate || change.Type == backupv1alpha1.ChangeTypePatch {
-			if err := r.updateRollbackRV(ctx, txn, change, ns, userClient); err != nil {
-				log.Error(err, "failed to update rollback RV after commit", "resourcechange", rc.Name)
-				// Non-fatal: worst case rollback will detect a false conflict.
-			}
-		}
 
 		log.Info("item committed", "resourcechange", rc.Name, "type", change.Type, "kind", change.Target.Kind, "name", change.Target.Name)
 		r.event(txn, corev1.EventTypeNormal, "ItemCommitted", "%s: %s %s/%s committed", rc.Name, change.Type, change.Target.Kind, change.Target.Name)
@@ -746,8 +760,10 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 }
 
 // checkConflict verifies that a target resource has not been modified since prepare.
+// committedRV, if non-empty, is the post-commit RV from a previous (crashed) attempt;
+// a match indicates a self-write rather than an external modification.
 func (r *TransactionReconciler) checkConflict(ctx context.Context, cl client.Client,
-	change backupv1alpha1.ResourceChangeSpec, ns string, expectedRV string) error {
+	change backupv1alpha1.ResourceChangeSpec, ns string, expectedRV, committedRV string) error {
 
 	if expectedRV == "" {
 		return nil
@@ -760,11 +776,16 @@ func (r *TransactionReconciler) checkConflict(ctx context.Context, cl client.Cli
 		}
 		return err
 	}
-	if obj.GetResourceVersion() != expectedRV {
+	currentRV := obj.GetResourceVersion()
+	if currentRV != expectedRV {
+		// Check if this is our own previous write (crash-retry).
+		if committedRV != "" && currentRV == committedRV {
+			return errSelfWrite
+		}
 		return &ErrConflictDetected{
 			Ref:      change.Target,
 			Expected: expectedRV,
-			Actual:   obj.GetResourceVersion(),
+			Actual:   currentRV,
 		}
 	}
 	return nil
@@ -1020,7 +1041,7 @@ func (r *TransactionReconciler) updateRollbackRV(ctx context.Context, txn *backu
 
 	raw, ok := cm.Data[rbKey]
 	if !ok {
-		return nil // No envelope to update (e.g. Create change).
+		return nil // No envelope to update.
 	}
 
 	var env rollback.Envelope
@@ -1035,6 +1056,26 @@ func (r *TransactionReconciler) updateRollbackRV(ctx context.Context, txn *backu
 	}
 	cm.Data[rbKey] = string(data)
 	return r.Update(ctx, cm)
+}
+
+// readCommittedRV reads the post-commit resourceVersion from the rollback
+// ConfigMap for the given resource. Returns "" if no RV is stored or if the
+// ConfigMap cannot be read (best-effort for self-write detection).
+func (r *TransactionReconciler) readCommittedRV(ctx context.Context, txn *backupv1alpha1.Transaction, change backupv1alpha1.ResourceChangeSpec, ns string) string {
+	rbKey := rollback.Key(change.Target.Kind, ns, change.Target.Name)
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); err != nil {
+		return ""
+	}
+	raw, ok := cm.Data[rbKey]
+	if !ok {
+		return ""
+	}
+	var env rollback.Envelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		return ""
+	}
+	return env.ResourceVersion
 }
 
 // --- Helpers ---
