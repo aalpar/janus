@@ -20,10 +20,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"strings"
+
+	flag "github.com/spf13/pflag"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -70,7 +71,7 @@ Commands:
 
 func runCreate(args []string) int {
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
-	namespace := fs.String("n", "default", "namespace")
+	namespace := fs.StringP("namespace", "n", "default", "namespace")
 	sa := fs.String("sa", "", "service account name (required)")
 	lockTimeout := fs.String("lock-timeout", "", "per-resource lock timeout (e.g. 5m)")
 	timeout := fs.String("timeout", "", "overall transaction timeout (e.g. 30m)")
@@ -131,11 +132,11 @@ func runCreate(args []string) int {
 
 func runAdd(args []string) int {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
-	namespace := fs.String("n", "default", "namespace")
+	namespace := fs.StringP("namespace", "n", "default", "namespace")
 	changeType := fs.String("type", "", "change type: Create, Update, Patch, or Delete (required)")
 	target := fs.String("target", "", "target resource as Kind/Name (required)")
 	targetNS := fs.String("target-ns", "", "target resource namespace (defaults to transaction namespace)")
-	contentFile := fs.String("f", "", "path to content YAML file")
+	contentFile := fs.StringP("file", "f", "", "path to content YAML file")
 	order := fs.Int("order", 0, "execution order (lower executes first)")
 	changeName := fs.String("name", "", "ResourceChange name (auto-generated if omitted)")
 	fs.Parse(args)
@@ -245,7 +246,7 @@ func runAdd(args []string) int {
 
 func runSeal(args []string) int {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
-	namespace := fs.String("n", "default", "namespace")
+	namespace := fs.StringP("namespace", "n", "default", "namespace")
 	fs.Parse(args)
 
 	if fs.NArg() == 0 {
@@ -286,7 +287,7 @@ func runRecover(args []string) int {
 
 	subcmd := args[0]
 	fs := flag.NewFlagSet("recover "+subcmd, flag.ExitOnError)
-	namespace := fs.String("n", "default", "namespace of the transaction")
+	namespace := fs.StringP("namespace", "n", "default", "namespace of the transaction")
 	force := fs.Bool("force", false, "force apply even on RV conflicts")
 	fs.Parse(args[1:])
 
