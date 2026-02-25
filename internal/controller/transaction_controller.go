@@ -907,7 +907,7 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 	case backupv1alpha1.ChangeTypeCreate:
 		// If the resource didn't exist before, reverse = delete.
 		// If it existed, reverse = SSA-apply prior values (like Patch rollback).
-		obj, _, err := loadRollbackState(rbCM, rbKey, namespace)
+		obj, storedRV, err := loadRollbackState(rbCM, rbKey, namespace)
 		if err != nil {
 			return err
 		}
@@ -920,9 +920,34 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 				}
 				return err
 			}
+			// Check for external modifications since commit.
+			if storedRV != "" && existing.GetResourceVersion() != storedRV {
+				return &ErrRollbackConflict{
+					Ref:       change.Target,
+					StoredRV:  storedRV,
+					CurrentRV: existing.GetResourceVersion(),
+				}
+			}
 			return cl.Delete(ctx, existing)
 		}
 		// Resource existed before — restore prior field values via SSA.
+		// Check for external modifications since commit.
+		if storedRV != "" {
+			existing, err := r.getResource(ctx, cl, change.Target, namespace)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return &ErrRollbackConflict{Ref: change.Target, StoredRV: storedRV}
+				}
+				return err
+			}
+			if existing.GetResourceVersion() != storedRV {
+				return &ErrRollbackConflict{
+					Ref:       change.Target,
+					StoredRV:  storedRV,
+					CurrentRV: existing.GetResourceVersion(),
+				}
+			}
+		}
 		var contentMap map[string]any
 		if err := json.Unmarshal(change.Content.Raw, &contentMap); err != nil {
 			return &ResourceOpError{Op: "unmarshaling create content for reverse", Err: err}
@@ -957,9 +982,27 @@ func (r *TransactionReconciler) applyRollback(ctx context.Context, cl client.Cli
 
 	case backupv1alpha1.ChangeTypePatch:
 		// Reverse of Patch = SSA-apply prior values for the patched fields.
-		obj, _, err := loadRollbackState(rbCM, rbKey, namespace)
+		obj, storedRV, err := loadRollbackState(rbCM, rbKey, namespace)
 		if err != nil {
 			return err
+		}
+
+		// Check for external modifications since commit.
+		if storedRV != "" {
+			existing, err := r.getResource(ctx, cl, change.Target, namespace)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return &ErrRollbackConflict{Ref: change.Target, StoredRV: storedRV}
+				}
+				return err
+			}
+			if existing.GetResourceVersion() != storedRV {
+				return &ErrRollbackConflict{
+					Ref:       change.Target,
+					StoredRV:  storedRV,
+					CurrentRV: existing.GetResourceVersion(),
+				}
+			}
 		}
 
 		// Parse the forward patch content to know which fields were touched.

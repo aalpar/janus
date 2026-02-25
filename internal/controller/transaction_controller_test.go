@@ -2413,10 +2413,10 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
 
-		It("Patch rollback when target deleted externally re-creates via SSA Apply", func() {
+		It("Patch rollback when target deleted externally detects conflict", func() {
 			// Patch committed, then target deleted externally before rollback.
-			// The reverse SSA Apply acts as an upsert — it re-creates the resource
-			// with the rolled-back field values.
+			// The RV check detects the deletion as a conflict (resource gone
+			// but stored RV exists), so the transaction ends as Failed.
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "rb-edge-patch-del-cm",
@@ -2480,19 +2480,13 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-txn"), txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
 
-			// Rollback: SSA Apply on deleted resource acts as upsert → re-creates.
-			reconcileToPhase(reconciler, "rb-edge-patch-del-txn", backupv1alpha1.TransactionPhaseRolledBack)
+			// Rollback: RV check detects deletion as conflict → Failed.
+			reconcileToPhase(reconciler, "rb-edge-patch-del-txn", backupv1alpha1.TransactionPhaseFailed)
 
 			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-txn"), txn)).To(Succeed())
-			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
-			Expect(txn.Status.Items[0].RolledBack).To(BeTrue())
-
-			// SSA Apply re-created the resource with the original data value.
-			Expect(k8sClient.Get(ctx, nn("rb-edge-patch-del-cm"), cm)).To(Succeed())
-			Expect(cm.Data["key"]).To(Equal("original"))
-
-			// Clean up.
-			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+			Expect(txn.Status.Items[0].RolledBack).To(BeFalse())
+			Expect(txn.Status.Items[0].Error).To(ContainSubstring("rollback conflict"))
 		})
 
 		It("Update rollback re-creates when target deleted externally", func() {
@@ -3673,6 +3667,141 @@ var _ = Describe("Transaction Controller", func() {
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
+
+		It("should detect rollback conflict on Patch when resource modified after commit", func() {
+			// Create target ConfigMap.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rb-patch-conflict-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original", "other": "untouched"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			// Two-item transaction: Patch item 0, then item 1 (blocker) fails to trigger rollback.
+			txn := minimalTxn("rb-patch-conflict-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			patchRC := createChange("rb-patch-conflict-txn", "rb-patch-conflict-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-patch-conflict-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: []byte(`{"data":{"key":"patched"}}`)},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, patchRC)).To(Succeed())
+
+			blocker := blockerChange("rb-patch-conflict-txn", "rb-patch-conflict-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
+
+			// Use a lock manager that fails Renew on the blocker to trigger rollback.
+			reconciler.LockMgr = &fakeLockMgr{
+				renewFn: func(_ context.Context, lease lock.LeaseRef, _ string, _ time.Duration) error {
+					if lease.Name == lock.LeaseName(lock.ResourceKey{
+						Namespace: testNamespace,
+						Kind:      "ConfigMap",
+						Name:      "rb-patch-conflict-blocker",
+					}) {
+						return &lock.ErrLockExpired{LeaseName: lease.Name}
+					}
+					return nil
+				},
+			}
+
+			// Reconcile: item 0 commits, item 1 triggers rollback.
+			reconcileToPhase(reconciler, "rb-patch-conflict-txn", backupv1alpha1.TransactionPhaseRollingBack)
+
+			// External actor modifies the patched field after Janus committed.
+			Expect(k8sClient.Get(ctx, nn("rb-patch-conflict-cm"), cm)).To(Succeed())
+			cm.Data["key"] = "externally-modified-after-commit"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+			// Reconcile rollback — should detect conflict and fail.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, nn("rb-patch-conflict-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseRolledBack {
+					break
+				}
+				_, err := reconciler.Reconcile(ctx, req("rb-patch-conflict-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(k8sClient.Get(ctx, nn("rb-patch-conflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("should detect rollback conflict on Create (fresh) when resource modified after commit", func() {
+			cmContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "rb-create-conflict-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "from-janus"},
+			}
+			raw, err := json.Marshal(cmContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := minimalTxn("rb-create-conflict-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+
+			createRC := createChange("rb-create-conflict-txn", "rb-create-conflict-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "rb-create-conflict-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, createRC)).To(Succeed())
+
+			blocker := blockerChange("rb-create-conflict-txn", "rb-create-conflict-blocker", txn.UID)
+			Expect(k8sClient.Create(ctx, blocker)).To(Succeed())
+
+			reconciler.LockMgr = &fakeLockMgr{
+				renewFn: func(_ context.Context, lease lock.LeaseRef, _ string, _ time.Duration) error {
+					if lease.Name == lock.LeaseName(lock.ResourceKey{
+						Namespace: testNamespace,
+						Kind:      "ConfigMap",
+						Name:      "rb-create-conflict-blocker",
+					}) {
+						return &lock.ErrLockExpired{LeaseName: lease.Name}
+					}
+					return nil
+				},
+			}
+
+			reconcileToPhase(reconciler, "rb-create-conflict-txn", backupv1alpha1.TransactionPhaseRollingBack)
+
+			// External actor modifies the resource after Janus created it.
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, nn("rb-create-conflict-cm"), cm)).To(Succeed())
+			cm.Data["key"] = "externally-modified"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+			// Reconcile rollback — should detect conflict.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, nn("rb-create-conflict-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseRolledBack {
+					break
+				}
+				_, err = reconciler.Reconcile(ctx, req("rb-create-conflict-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(k8sClient.Get(ctx, nn("rb-create-conflict-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
 	})
 
 	Context("Patch rollback via reverse SSA patch", func() {
@@ -3727,10 +3856,6 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, nn("ssa-rb-cm"), target)).To(Succeed())
 			Expect(target.Data["key"]).To(Equal("patched"))
 
-			// Externally add an unrelated field (bumps RV).
-			target.Data["unrelated"] = "external-addition"
-			Expect(k8sClient.Update(ctx, target)).To(Succeed())
-
 			// Swap to failing lock manager: item 1's lock renewal fails → RollingBack.
 			reconciler.LockMgr = failingRenewLockMgr()
 			_, err = reconciler.Reconcile(ctx, req("ssa-rb-txn"))
@@ -3742,10 +3867,9 @@ var _ = Describe("Transaction Controller", func() {
 			// Reconcile: RollingBack → reverse SSA patch rolls back item 0 → RolledBack.
 			reconcileToPhase(reconciler, "ssa-rb-txn", backupv1alpha1.TransactionPhaseRolledBack)
 
-			// Verify: key restored to original, unrelated field preserved.
+			// Verify: key restored to original.
 			Expect(k8sClient.Get(ctx, nn("ssa-rb-cm"), target)).To(Succeed())
 			Expect(target.Data["key"]).To(Equal("original"))
-			Expect(target.Data["unrelated"]).To(Equal("external-addition"))
 
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, target)).To(Succeed())
