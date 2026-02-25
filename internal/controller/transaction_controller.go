@@ -549,6 +549,24 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 
 		ns := r.resolveNamespace(change.Target, txn.Namespace)
 
+		// For Create: if the resource didn't exist at prepare time,
+		// verify it still doesn't before applying.
+		if change.Type == backupv1alpha1.ChangeTypeCreate && item.ResourceVersion == "" {
+			_, err := r.getResource(ctx, userClient, change.Target, ns)
+			if err == nil {
+				// Resource was created externally between prepare and commit.
+				txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()
+				log.Error(nil, "conflict detected: resource created externally", "resourcechange", rc.Name)
+				r.event(txn, corev1.EventTypeWarning, "ConflictDetected",
+					"%s: %s/%s was created externally since prepare", rc.Name, change.Target.Kind, change.Target.Name)
+				return ctrl.Result{}, r.setFailed(ctx, txn,
+					(&ErrConflictDetected{Ref: change.Target}).Error())
+			}
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		}
+
 		// Check for external modifications since prepare.
 		if err := r.checkConflict(ctx, userClient, change, ns, item.ResourceVersion); err != nil {
 			txmetrics.ItemOperations.WithLabelValues("commit", "conflict").Inc()

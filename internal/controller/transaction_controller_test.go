@@ -2827,6 +2827,59 @@ var _ = Describe("Transaction Controller", func() {
 			}, cm)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
+
+		It("should detect conflict when resource is created externally between prepare and commit", func() {
+			cmContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "ext-create-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "from-janus"},
+			}
+			raw, err := json.Marshal(cmContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := minimalTxn("ext-create-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("ext-create-txn", "ext-create-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ext-create-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+
+			reconcileToPhase(reconciler, "ext-create-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// External actor creates the resource between prepare and commit.
+			extCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ext-create-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "from-external"},
+			}
+			Expect(k8sClient.Create(ctx, extCM)).To(Succeed())
+
+			// Reconcile — should detect conflict and fail.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, nn("ext-create-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted {
+					break
+				}
+				_, err := reconciler.Reconcile(ctx, req("ext-create-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(k8sClient.Get(ctx, nn("ext-create-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, extCM)).To(Succeed())
+		})
 	})
 
 	Context("status conditions", func() {
