@@ -12,9 +12,9 @@ pp. 249-259.
 
 > Introduces the Saga pattern: a long-lived transaction broken into a
 > sequence of sub-transactions, each paired with a compensating action.
-> Janus's Transaction CRD is a direct implementation — `spec.changes`
-> defines the forward steps, and the controller generates compensating
-> actions from captured prior state.
+> Janus's Transaction CRD is a direct implementation — each
+> ResourceChange CR defines a forward step, and the controller generates
+> compensating actions from prior state captured during the prepare phase.
 
 ## Transaction Processing and Atomic Commitment
 
@@ -40,8 +40,10 @@ Control and Recovery in Database Systems*. Addison-Wesley. Chapter 7:
 Distributed Commit.
 
 > Foundational theory of distributed commit protocols and their failure
-> modes. Janus's lock-then-capture-then-mutate sequencing follows
-> the strict two-phase locking discipline described here.
+> modes. Janus's lock-then-capture-then-mutate sequencing mirrors the
+> structure of two-phase locking — acquire before mutate, release after
+> commit — but uses advisory Lease-based locks that coordinate between
+> Janus transactions without server-enforced exclusion.
 
 ## Crash Recovery in Distributed Systems
 
@@ -123,12 +125,11 @@ no 2, pp. 213-226.
 > locking. Kubernetes adopted this as `resourceVersion` semantics:
 > clients read state, compute changes, and submit updates that include
 > the observed version; the API server rejects stale writes with a 409
-> Conflict. Every status update in Janus's reconciliation loop is an
-> optimistic write — if a concurrent reconciliation has advanced the
-> Transaction's state, the controller re-reads and retries. This paper
-> also informs a current gap in Janus: detecting resource modifications
-> between prepare and commit would apply the same read-validate-write
-> discipline to the target resources themselves.
+> Conflict. Janus applies this pattern at two levels: every status update
+> in the reconciliation loop is an optimistic write (re-read on conflict),
+> and commit-time conflict detection compares prepare-time resourceVersions
+> against current state to detect external modifications to target
+> resources between phases.
 
 ## Distributed Coordination Services
 
