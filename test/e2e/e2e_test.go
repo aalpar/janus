@@ -260,6 +260,9 @@ rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get","list","watch","create","update","patch","delete"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get","list","watch"]
 `, testNS))).To(Succeed())
 
 			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: rbac.authorization.k8s.io/v1
@@ -279,6 +282,11 @@ subjects:
 		})
 
 		AfterAll(func() {
+			By("stripping finalizers from any remaining transactions")
+			// Prevents namespace deletion from blocking on leftover finalizers.
+			_, _ = kubectl("patch", "transactions", "-n", testNS, "--all",
+				"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
+
 			By("deleting the e2e test namespace")
 			_, _ = kubectl("delete", "ns", testNS, "--ignore-not-found")
 		})
