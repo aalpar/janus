@@ -75,34 +75,36 @@ func runCreate(args []string) int {
 	sa := fs.String("sa", "", "service account name (required)")
 	lockTimeout := fs.String("lock-timeout", "", "per-resource lock timeout (e.g. 5m)")
 	timeout := fs.String("timeout", "", "overall transaction timeout (e.g. 30m)")
+	generateName := fs.StringP("generate-name", "g", "", "name prefix for server-generated name")
 	fs.Parse(args)
 
-	if fs.NArg() == 0 {
+	hasName := fs.NArg() > 0
+	hasGenerate := *generateName != ""
+	if hasName == hasGenerate {
 		fmt.Fprintf(os.Stderr, "Usage: janus create <name> --sa <service-account> [-n namespace]\n")
+		fmt.Fprintf(os.Stderr, "       janus create -g <prefix> --sa <service-account> [-n namespace]\n")
+		fmt.Fprintf(os.Stderr, "\nProvide either a name or --generate-name, not both.\n")
 		return 1
 	}
 	if *sa == "" {
 		fmt.Fprintf(os.Stderr, "Error: --sa is required\n")
 		return 1
 	}
-	txnName := fs.Arg(0)
-
-	ctx := context.Background()
-	cl, err := buildClient()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
-		return 1
-	}
 
 	txn := &backupv1alpha1.Transaction{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      txnName,
 			Namespace: *namespace,
 		},
 		Spec: backupv1alpha1.TransactionSpec{
 			ServiceAccountName: *sa,
 		},
 	}
+	if hasName {
+		txn.Name = fs.Arg(0)
+	} else {
+		txn.GenerateName = *generateName
+	}
+
 	if *lockTimeout != "" {
 		d, err := parseDuration(*lockTimeout)
 		if err != nil {
@@ -120,11 +122,19 @@ func runCreate(args []string) int {
 		txn.Spec.Timeout = d
 	}
 
+	ctx := context.Background()
+	cl, err := buildClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
+		return 1
+	}
+
 	if err := cl.Create(ctx, txn); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating Transaction: %v\n", err)
 		return 1
 	}
-	fmt.Printf("Transaction %s/%s created (unsealed)\n", txn.Namespace, txn.Name)
+	fmt.Fprintln(os.Stdout, txn.Name)
+	fmt.Fprintf(os.Stderr, "Transaction %s/%s created (unsealed)\n", txn.Namespace, txn.Name)
 	return 0
 }
 
