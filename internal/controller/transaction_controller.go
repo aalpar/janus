@@ -119,7 +119,7 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	case backupv1alpha1.TransactionPhaseCommitted,
 		backupv1alpha1.TransactionPhaseRolledBack:
 		changed := controllerutil.RemoveFinalizer(&txn, finalizerName)
-		changed = controllerutil.RemoveFinalizer(&txn, rollbackProtectionFinalizer) || changed
+		// rollbackProtectionFinalizer is user-managed; the controller never removes it.
 		if changed {
 			if err := r.Update(ctx, &txn); err != nil {
 				return ctrl.Result{}, err
@@ -140,7 +140,7 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			r.event(&txn, corev1.EventTypeWarning, "RecoveryBlocked", "cannot recover: rollback ConfigMap %q missing", txn.Status.RollbackRef)
 		}
 		changed := controllerutil.RemoveFinalizer(&txn, finalizerName)
-		changed = controllerutil.RemoveFinalizer(&txn, rollbackProtectionFinalizer) || changed
+		// rollbackProtectionFinalizer is user-managed; the controller never removes it.
 		if changed {
 			if err := r.Update(ctx, &txn); err != nil {
 				return ctrl.Result{}, err
@@ -265,21 +265,28 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 	switch txn.Status.Phase {
 	case backupv1alpha1.TransactionPhaseCommitted,
 		backupv1alpha1.TransactionPhaseRolledBack:
-		log.Info("deleting terminal transaction, releasing locks and removing finalizers")
+		log.Info("deleting terminal transaction, releasing locks and removing finalizer")
 		r.releaseAllLocks(ctx, txn)
 		controllerutil.RemoveFinalizer(txn, finalizerName)
-		controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
 		if err := r.Update(ctx, txn); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
+
+	case backupv1alpha1.TransactionPhaseRollingBack:
+		// Rollback in progress — let it complete (even if all items are already rolled back,
+		// the handler must run to transition the phase to RolledBack).
+		userClient, err := r.getImpersonatingClient(ctx, txn)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.handleRollingBack(ctx, txn, userClient)
 	}
 
 	if !r.hasUnrolledCommits(txn) {
-		log.Info("no unrolled commits, releasing locks and removing finalizers")
+		log.Info("no unrolled commits, releasing locks and removing finalizer")
 		r.releaseAllLocks(ctx, txn)
 		controllerutil.RemoveFinalizer(txn, finalizerName)
-		controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
 		if err := r.Update(ctx, txn); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -288,14 +295,6 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 
 	// Has unrolled commits from here down.
 	switch txn.Status.Phase {
-	case backupv1alpha1.TransactionPhaseRollingBack:
-		// Rollback already in progress — let it continue.
-		userClient, err := r.getImpersonatingClient(ctx, txn)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return r.handleRollingBack(ctx, txn, userClient)
-
 	case backupv1alpha1.TransactionPhaseFailed:
 		// Rollback was attempted and failed.
 		_, hasRetry := txn.Annotations[annotationRetryRollback]
@@ -331,7 +330,6 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 		log.Info("rollback completed during deletion, cleaning up")
 		r.releaseAllLocks(ctx, txn)
 		controllerutil.RemoveFinalizer(txn, finalizerName)
-		controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
 		if err := r.Update(ctx, txn); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -753,13 +751,13 @@ func (r *TransactionReconciler) handleRollingBack(ctx context.Context, txn *back
 	log.Info("rollback loop complete, releasing locks")
 	r.releaseAllLocks(ctx, txn)
 
-	// Remove rollback-protection finalizer BEFORE setting status fields.
-	// r.Update refreshes the full object (including status) from the server,
-	// so any in-memory status changes must happen after this call.
+	// rollbackProtectionFinalizer is user-managed; the controller never removes it.
+	// Only strip the lease-cleanup finalizer here.
 	if !hasConflicts {
-		controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
-		if err := r.Update(ctx, txn); err != nil {
-			return ctrl.Result{}, err
+		if controllerutil.RemoveFinalizer(txn, finalizerName) {
+			if err := r.Update(ctx, txn); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 

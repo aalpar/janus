@@ -958,11 +958,11 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(ctrl.Result{}))
 
-			// Verify phase unchanged and finalizers removed.
+			// Verify phase unchanged; lease-cleanup finalizer removed, rollback-protection remains (user-managed).
 			Expect(k8sClient.Get(ctx, nn("terminal-committed"), txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
 			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
-			Expect(txn.Finalizers).NotTo(ContainElement(rollbackProtectionFinalizer))
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
 		})
 
 		It("should no-op for RolledBack", func() {
@@ -1162,7 +1162,7 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(txn.Finalizers).To(ContainElement(finalizerName))
 		})
 
-		It("should remove both finalizers at terminal states", func() {
+		It("should remove lease-cleanup finalizer at terminal states but keep rollback-protection", func() {
 			txn := minimalTxn("fin-terminal")
 			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
 			rc := createCMChange("fin-terminal", "fin-terminal-cm", txn.UID)
@@ -1182,13 +1182,13 @@ var _ = Describe("Transaction Controller", func() {
 			txn.Status.Phase = backupv1alpha1.TransactionPhaseCommitted
 			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
 
-			// Reconcile: terminal → strip both finalizers.
+			// Reconcile: terminal → strip lease-cleanup, keep rollback-protection (user-managed).
 			_, err = reconciler.Reconcile(ctx, req("fin-terminal"))
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("fin-terminal"), txn)).To(Succeed())
 			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
-			Expect(txn.Finalizers).NotTo(ContainElement(rollbackProtectionFinalizer))
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
 		})
 
 		It("should release leases on deletion during Preparing", func() {
@@ -1216,17 +1216,23 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, nn("fin-del-prep"), txn)).To(Succeed())
 			Expect(txn.Status.Items[0].LockLease).NotTo(BeEmpty())
 
-			// Delete the transaction — finalizer prevents immediate removal.
+			// Delete the transaction — finalizers prevent immediate removal.
 			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
 
-			// Reconcile: handleDeletion → release leases, remove finalizer.
+			// Reconcile: handleDeletion → release leases, remove lease-cleanup finalizer.
 			_, err = reconciler.Reconcile(ctx, req("fin-del-prep"))
 			Expect(err).NotTo(HaveOccurred())
 
 			// Verify leases were released.
 			Expect(releasedLeases).To(HaveLen(1))
 
-			// Object should be gone (finalizer removed → GC).
+			// rollback-protection remains — simulate user removing it.
+			Expect(k8sClient.Get(ctx, nn("fin-del-prep"), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
+			controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
+			// Object should now be gone.
 			err = k8sClient.Get(ctx, nn("fin-del-prep"), txn)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
@@ -1247,11 +1253,17 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, nn("fin-del-pending"), txn)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
 
-			// Reconcile: handleDeletion with no leases, no unrolled commits.
+			// Reconcile: handleDeletion with no leases, no unrolled commits — removes lease-cleanup.
 			_, err = reconciler.Reconcile(ctx, req("fin-del-pending"))
 			Expect(err).NotTo(HaveOccurred())
 
-			// Object should be gone (both finalizers removed).
+			// rollback-protection remains — simulate user removing it.
+			Expect(k8sClient.Get(ctx, nn("fin-del-pending"), txn)).To(Succeed())
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
+			controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
+			// Object should now be gone.
 			err = k8sClient.Get(ctx, nn("fin-del-pending"), txn)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
@@ -1310,16 +1322,25 @@ var _ = Describe("Transaction Controller", func() {
 			// Now delete the transaction (automatic-rollback present from seal time).
 			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
 
-			// Keep reconciling — deletion triggers rollback, then GC.
+			// Keep reconciling — deletion triggers rollback.
 			for range 20 {
-				err = k8sClient.Get(ctx, nn("del-commit-txn"), txn)
-				if apierrors.IsNotFound(err) {
+				Expect(k8sClient.Get(ctx, nn("del-commit-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseRolledBack {
 					break
 				}
-				Expect(err).NotTo(HaveOccurred())
 				_, err = reconciler.Reconcile(ctx, req("del-commit-txn"))
 				Expect(err).NotTo(HaveOccurred())
 			}
+
+			// Rollback complete — simulate user removing rollback-protection.
+			Expect(k8sClient.Get(ctx, nn("del-commit-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
+			// Final reconcile removes lease-cleanup → GC.
+			_, err = reconciler.Reconcile(ctx, req("del-commit-txn"))
+			Expect(err).NotTo(HaveOccurred())
 
 			err = k8sClient.Get(ctx, nn("del-commit-txn"), txn)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
@@ -1426,16 +1447,24 @@ var _ = Describe("Transaction Controller", func() {
 			txn.Annotations[annotationAutoRollback] = "true"
 			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
 
-			// Reconcile until GC.
+			// Reconcile until terminal, then simulate user removing rollback-protection.
 			for range 20 {
-				err = k8sClient.Get(ctx, nn("del-retry-txn"), txn)
-				if apierrors.IsNotFound(err) {
+				Expect(k8sClient.Get(ctx, nn("del-retry-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseRolledBack {
 					break
 				}
-				Expect(err).NotTo(HaveOccurred())
 				_, err = reconciler.Reconcile(ctx, req("del-retry-txn"))
 				Expect(err).NotTo(HaveOccurred())
 			}
+
+			Expect(k8sClient.Get(ctx, nn("del-retry-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+			controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
+			// One more reconcile to remove lease-cleanup finalizer via handleDeletion.
+			_, err = reconciler.Reconcile(ctx, req("del-retry-txn"))
+			Expect(err).NotTo(HaveOccurred())
 
 			err = k8sClient.Get(ctx, nn("del-retry-txn"), txn)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
@@ -1498,17 +1527,21 @@ var _ = Describe("Transaction Controller", func() {
 			rc := createCMChange("del-no-unrolled", "del-no-unrolled-cm", txn.UID)
 			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
 
-			// Drive to Committed (no unrolled commits).
+			// Drive to Committed.
 			reconcileToPhase(reconciler, "del-no-unrolled", backupv1alpha1.TransactionPhaseCommitted)
 
-			// Terminal handler strips both finalizers. Delete should be instant.
+			// Terminal handler strips lease-cleanup; rollback-protection remains (user-managed).
 			_, err := reconciler.Reconcile(ctx, req("del-no-unrolled"))
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, nn("del-no-unrolled"), txn)).To(Succeed())
-			Expect(txn.Finalizers).To(BeEmpty())
+			Expect(txn.Finalizers).NotTo(ContainElement(finalizerName))
+			Expect(txn.Finalizers).To(ContainElement(rollbackProtectionFinalizer))
 
-			// Delete — no finalizers means immediate GC.
+			// Simulate user removing rollback-protection, then delete.
+			controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
 			Expect(k8sClient.Delete(ctx, txn)).To(Succeed())
 			err = k8sClient.Get(ctx, nn("del-no-unrolled"), txn)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
