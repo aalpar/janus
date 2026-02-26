@@ -21,17 +21,17 @@ func testScheme() *runtime.Scheme {
 }
 
 // priorStateCM returns a JSON-serialized ConfigMap suitable for use as PriorState.
-func priorStateCM(name, namespace, dataKey, dataVal string) json.RawMessage {
+func priorStateCM(name, dataVal string) json.RawMessage {
 	cm := map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
 		"metadata": map[string]any{
 			"name":            name,
-			"namespace":       namespace,
+			"namespace":       "ns-1",
 			"resourceVersion": "should-be-stripped",
 			"uid":             "should-be-stripped",
 		},
-		"data": map[string]string{dataKey: dataVal},
+		"data": map[string]string{"key": dataVal},
 	}
 	b, _ := json.Marshal(cm)
 	return b
@@ -112,7 +112,7 @@ func TestApplyItem_Restore(t *testing.T) {
 			rbKey: mustMarshal(rollback.Envelope{
 				ResourceVersion: "200",
 				ChangeType:      "Patch",
-				PriorState:      priorStateCM("cm-patched", "ns-1", "key", "old-value"),
+				PriorState:      priorStateCM("cm-patched", "old-value"),
 			}),
 		},
 	}
@@ -148,7 +148,7 @@ func TestApplyItem_RestoreNotFound(t *testing.T) {
 			rbKey: mustMarshal(rollback.Envelope{
 				ResourceVersion: "150",
 				ChangeType:      "Delete",
-				PriorState:      priorStateCM("cm-deleted", "ns-1", "key", "restored"),
+				PriorState:      priorStateCM("cm-deleted", "restored"),
 			}),
 		},
 	}
@@ -190,7 +190,7 @@ func TestApplyItem_ConflictRefused(t *testing.T) {
 			rbKey: mustMarshal(rollback.Envelope{
 				ResourceVersion: "100", // stored RV != current 999
 				ChangeType:      "Patch",
-				PriorState:      priorStateCM("cm-conflict", "ns-1", "key", "old"),
+				PriorState:      priorStateCM("cm-conflict", "old"),
 			}),
 		},
 	}
@@ -232,7 +232,7 @@ func TestApplyItem_ConflictForced(t *testing.T) {
 			rbKey: mustMarshal(rollback.Envelope{
 				ResourceVersion: "100", // mismatch, but Force=true
 				ChangeType:      "Patch",
-				PriorState:      priorStateCM("cm-force", "ns-1", "key", "old"),
+				PriorState:      priorStateCM("cm-force", "old"),
 			}),
 		},
 	}

@@ -2832,7 +2832,7 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
 				Name: "conflict-patch-cm", Namespace: testNamespace,
 			}, cm)).To(Succeed())
-			cm.Data["key"] = "externally-modified"
+			cm.Data["key"] = "externally-modified" //nolint:goconst // test data
 			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
 
 			// Reconcile through Committing — SSA Patch skips RV conflict check

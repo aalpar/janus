@@ -163,24 +163,8 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Check transaction-level timeout for non-terminal, in-progress phases.
-	if txn.Status.StartedAt != nil && !isTerminalPhase(txn.Status.Phase) {
-		deadline := txn.Status.StartedAt.Time.Add(r.transactionTimeout(&txn))
-		if time.Now().After(deadline) {
-			elapsed := time.Since(txn.Status.StartedAt.Time).Round(time.Second)
-			if txn.Status.Phase == backupv1alpha1.TransactionPhaseRollingBack {
-				log.Info("rollback timed out", "elapsed", elapsed)
-				return ctrl.Result{}, r.failAndReleaseLocks(ctx, &txn, fmt.Sprintf("rollback timed out after %s", elapsed))
-			}
-			if r.hasUnrolledCommits(&txn) {
-				log.Info("transaction timed out with committed items, initiating rollback", "elapsed", elapsed)
-				r.event(&txn, corev1.EventTypeWarning, "Timeout", "transaction timed out after %s, rolling back", elapsed)
-				now := metav1.Now()
-				txn.Status.StartedAt = &now // Reset so rollback gets a fresh timeout window.
-				return r.transition(ctx, &txn, backupv1alpha1.TransactionPhaseRollingBack)
-			}
-			log.Info("transaction timed out with no commits", "elapsed", elapsed)
-			return ctrl.Result{}, r.failAndReleaseLocks(ctx, &txn, fmt.Sprintf("transaction timed out after %s", elapsed))
-		}
+	if timedOut, result, err := r.checkTimeout(ctx, &txn); timedOut {
+		return result, err
 	}
 
 	// Phases that don't need an impersonating client.
@@ -208,6 +192,34 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// checkTimeout handles transaction-level timeout for non-terminal phases.
+// Returns (true, result, err) if the timeout fired, (false, _, _) otherwise.
+func (r *TransactionReconciler) checkTimeout(ctx context.Context, txn *backupv1alpha1.Transaction) (bool, ctrl.Result, error) {
+	if txn.Status.StartedAt == nil || isTerminalPhase(txn.Status.Phase) {
+		return false, ctrl.Result{}, nil
+	}
+	deadline := txn.Status.StartedAt.Add(r.transactionTimeout(txn))
+	if !time.Now().After(deadline) {
+		return false, ctrl.Result{}, nil
+	}
+	log := logf.FromContext(ctx)
+	elapsed := time.Since(txn.Status.StartedAt.Time).Round(time.Second)
+	if txn.Status.Phase == backupv1alpha1.TransactionPhaseRollingBack {
+		log.Info("rollback timed out", "elapsed", elapsed)
+		return true, ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("rollback timed out after %s", elapsed))
+	}
+	if r.hasUnrolledCommits(txn) {
+		log.Info("transaction timed out with committed items, initiating rollback", "elapsed", elapsed)
+		r.event(txn, corev1.EventTypeWarning, "Timeout", "transaction timed out after %s, rolling back", elapsed)
+		now := metav1.Now()
+		txn.Status.StartedAt = &now // Reset so rollback gets a fresh timeout window.
+		result, err := r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
+		return true, result, err
+	}
+	log.Info("transaction timed out with no commits", "elapsed", elapsed)
+	return true, ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("transaction timed out after %s", elapsed))
 }
 
 // getImpersonatingClient validates the SA and returns a cached impersonating client.

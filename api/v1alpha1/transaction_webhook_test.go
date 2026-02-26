@@ -57,7 +57,7 @@ func TestValidateUpdate_ImmutableOnceSealed(t *testing.T) {
 	oldTxn.Spec.Sealed = true
 	newTxn := validTxn()
 	newTxn.Spec.Sealed = true
-	newTxn.Spec.ServiceAccountName = "different-sa"
+	newTxn.Spec.ServiceAccountName = "different-sa" //nolint:goconst // test data
 	_, err := v.ValidateUpdate(context.Background(), oldTxn, newTxn)
 	if err == nil {
 		t.Fatal("expected error for spec change after sealing")
