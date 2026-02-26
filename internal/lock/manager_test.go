@@ -289,7 +289,7 @@ func TestRelease_DeletesExistingLease(t *testing.T) {
 	}
 	m := newManager(existing)
 
-	if err := m.Release(testCtx, LeaseRef{Name: name, Namespace: "default"}); err != nil {
+	if err := m.Release(testCtx, LeaseRef{Name: name, Namespace: "default"}, txnOwner); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -303,7 +303,7 @@ func TestRelease_DeletesExistingLease(t *testing.T) {
 
 func TestRelease_NoOpWhenAlreadyGone(t *testing.T) {
 	m := newManager()
-	if err := m.Release(testCtx, LeaseRef{Name: "nonexistent-lease", Namespace: "default"}); err != nil {
+	if err := m.Release(testCtx, LeaseRef{Name: "nonexistent-lease", Namespace: "default"}, txnOwner); err != nil {
 		t.Fatalf("expected no error for missing lease, got: %v", err)
 	}
 }
@@ -315,7 +315,7 @@ func TestRelease_GetError(t *testing.T) {
 		},
 	})
 
-	err := m.Release(testCtx, LeaseRef{Name: "some-lease", Namespace: "default"})
+	err := m.Release(testCtx, LeaseRef{Name: "some-lease", Namespace: "default"}, txnOwner)
 	if err == nil || err.Error() != "getting lease some-lease: synthetic get error" {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -338,9 +338,43 @@ func TestRelease_DeleteError(t *testing.T) {
 		},
 	}, existing)
 
-	err := m.Release(testCtx, LeaseRef{Name: name, Namespace: "default"})
+	err := m.Release(testCtx, LeaseRef{Name: name, Namespace: "default"}, txnOwner)
 	if err == nil || err.Error() != fmt.Sprintf("deleting lease %s: synthetic delete error", name) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRelease_SkipsWhenHeldByDifferentTxn(t *testing.T) {
+	name := LeaseName(testKey)
+	holder := txnOther
+	existing := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "janus",
+				"janus.io/transaction":         txnOther,
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity: &holder,
+		},
+	}
+	m := newManager(existing)
+
+	// Release as txnOwner — should be a no-op because holder is txnOther.
+	if err := m.Release(testCtx, LeaseRef{Name: name, Namespace: "default"}, txnOwner); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the lease still exists.
+	leaseList := &coordinationv1.LeaseList{}
+	_ = m.Client.List(testCtx, leaseList)
+	if len(leaseList.Items) != 1 {
+		t.Fatalf("expected 1 lease, got %d", len(leaseList.Items))
+	}
+	if got := holderOf(&leaseList.Items[0]); got != txnOther {
+		t.Fatalf("expected holder %q, got %q", txnOther, got)
 	}
 }
 
@@ -369,7 +403,7 @@ func TestReleaseAll_MultipleLeasesReleased(t *testing.T) {
 	err := m.ReleaseAll(testCtx, []LeaseRef{
 		{Name: name1, Namespace: "default"},
 		{Name: name2, Namespace: "default"},
-	})
+	}, txnOwner)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -383,7 +417,7 @@ func TestReleaseAll_MultipleLeasesReleased(t *testing.T) {
 
 func TestReleaseAll_SkipsEmptyNames(t *testing.T) {
 	m := newManager()
-	err := m.ReleaseAll(testCtx, []LeaseRef{{}, {}, {}})
+	err := m.ReleaseAll(testCtx, []LeaseRef{{}, {}, {}}, txnOwner)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -399,7 +433,7 @@ func TestReleaseAll_ReturnsFirstError(t *testing.T) {
 	err := m.ReleaseAll(testCtx, []LeaseRef{
 		{Name: "lease-a", Namespace: "default"},
 		{Name: "lease-b", Namespace: "default"},
-	})
+	}, txnOwner)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -869,7 +903,7 @@ func TestRenew_EmptyTransactionName(t *testing.T) {
 func TestReleaseAll_EmptySlice(t *testing.T) {
 	m := newManager()
 	// ReleaseAll with empty slice should return no error.
-	err := m.ReleaseAll(testCtx, []LeaseRef{})
+	err := m.ReleaseAll(testCtx, []LeaseRef{}, txnOwner)
 	if err != nil {
 		t.Fatalf("expected no error for empty slice, got: %v", err)
 	}
@@ -894,7 +928,7 @@ func TestReleaseAll_MixedEmptyAndNonEmpty(t *testing.T) {
 		{Name: "", Namespace: "default"},
 		{Name: name2, Namespace: "default"},
 		{Name: "", Namespace: ""},
-	})
+	}, txnOwner)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

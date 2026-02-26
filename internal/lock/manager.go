@@ -47,11 +47,12 @@ type Manager interface {
 	// Returns the lease name on success.
 	Acquire(ctx context.Context, key ResourceKey, txnName string, timeout time.Duration) (string, error)
 
-	// Release deletes a single Lease lock.
-	Release(ctx context.Context, lease LeaseRef) error
+	// Release deletes a single Lease lock if held by the given transaction.
+	// If the lease is held by a different transaction, the call is a no-op.
+	Release(ctx context.Context, lease LeaseRef, txnName string) error
 
 	// ReleaseAll releases multiple leases, returning the first error encountered.
-	ReleaseAll(ctx context.Context, leases []LeaseRef) error
+	ReleaseAll(ctx context.Context, leases []LeaseRef, txnName string) error
 
 	// Renew extends the lease duration for a lock held by the given transaction.
 	// Returns an error if the lease is not found, expired, or held by a different transaction.
@@ -152,7 +153,7 @@ func (m *LeaseManager) Acquire(ctx context.Context, key ResourceKey, txnName str
 	return name, nil
 }
 
-func (m *LeaseManager) Release(ctx context.Context, lease LeaseRef) error {
+func (m *LeaseManager) Release(ctx context.Context, lease LeaseRef, txnName string) error {
 	existing := &coordinationv1.Lease{}
 	if err := m.Client.Get(ctx, client.ObjectKey{Name: lease.Name, Namespace: lease.Namespace}, existing); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -160,19 +161,22 @@ func (m *LeaseManager) Release(ctx context.Context, lease LeaseRef) error {
 		}
 		return &LeaseOpError{Op: "getting", LeaseName: lease.Name, Err: err}
 	}
+	if holder := holderOf(existing); holder != "" && holder != txnName {
+		return nil // Held by someone else — not our lock.
+	}
 	if err := m.Client.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
 		return &LeaseOpError{Op: "deleting", LeaseName: lease.Name, Err: err}
 	}
 	return nil
 }
 
-func (m *LeaseManager) ReleaseAll(ctx context.Context, leases []LeaseRef) error {
+func (m *LeaseManager) ReleaseAll(ctx context.Context, leases []LeaseRef, txnName string) error {
 	var firstErr error
 	for _, ref := range leases {
 		if ref.Name == "" {
 			continue
 		}
-		if err := m.Release(ctx, ref); err != nil && firstErr == nil {
+		if err := m.Release(ctx, ref, txnName); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

@@ -51,8 +51,8 @@ const (
 // fakeLockMgr is a controllable mock for lock.Manager used to trigger rollback paths.
 type fakeLockMgr struct {
 	acquireFn    func(ctx context.Context, key lock.ResourceKey, txnName string, timeout time.Duration) (string, error)
-	releaseFn    func(ctx context.Context, lease lock.LeaseRef) error
-	releaseAllFn func(ctx context.Context, leases []lock.LeaseRef) error
+	releaseFn    func(ctx context.Context, lease lock.LeaseRef, txnName string) error
+	releaseAllFn func(ctx context.Context, leases []lock.LeaseRef, txnName string) error
 	renewFn      func(ctx context.Context, lease lock.LeaseRef, txnName string, timeout time.Duration) error
 }
 
@@ -63,16 +63,16 @@ func (f *fakeLockMgr) Acquire(ctx context.Context, key lock.ResourceKey, txnName
 	return lock.LeaseName(key), nil
 }
 
-func (f *fakeLockMgr) Release(ctx context.Context, lease lock.LeaseRef) error {
+func (f *fakeLockMgr) Release(ctx context.Context, lease lock.LeaseRef, txnName string) error {
 	if f.releaseFn != nil {
-		return f.releaseFn(ctx, lease)
+		return f.releaseFn(ctx, lease, txnName)
 	}
 	return nil
 }
 
-func (f *fakeLockMgr) ReleaseAll(ctx context.Context, leases []lock.LeaseRef) error {
+func (f *fakeLockMgr) ReleaseAll(ctx context.Context, leases []lock.LeaseRef, txnName string) error {
 	if f.releaseAllFn != nil {
-		return f.releaseAllFn(ctx, leases)
+		return f.releaseAllFn(ctx, leases, txnName)
 	}
 	return nil
 }
@@ -692,6 +692,98 @@ var _ = Describe("Transaction Controller", func() {
 		})
 	})
 
+	Context("lease expiry and takeover", func() {
+		It("should roll back txn A when txn B takes over its expired lease", func() {
+			// Target resource both transactions will contend over.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "expiry-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "expiry-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "patched"},
+			}
+			raw, err := json.Marshal(patchContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			changeSpec := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "expiry-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: raw},
+			}
+
+			// Transaction A: prepare → Prepared (acquires lease via real lock manager).
+			txnA := minimalTxn("expiry-txn-a")
+			Expect(k8sClient.Create(ctx, txnA)).To(Succeed())
+			rcA := createChange("expiry-txn-a", "expiry-cm-change-a", changeSpec, txnA.UID)
+			Expect(k8sClient.Create(ctx, rcA)).To(Succeed())
+
+			reconcileToPhase(reconciler, "expiry-txn-a", backupv1alpha1.TransactionPhasePrepared)
+
+			// Verify the lease exists and is held by txn A.
+			leaseName := lock.LeaseName(lock.ResourceKey{
+				Namespace: testNamespace, Kind: "ConfigMap", Name: "expiry-cm",
+			})
+			lease := &coordinationv1.Lease{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: leaseName, Namespace: testNamespace,
+			}, lease)).To(Succeed())
+			Expect(*lease.Spec.HolderIdentity).To(Equal("expiry-txn-a"))
+
+			// Backdate the lease so it appears expired.
+			pastTime := metav1.NewMicroTime(time.Now().Add(-10 * time.Second))
+			durationSec := int32(1)
+			lease.Spec.RenewTime = &pastTime
+			lease.Spec.LeaseDurationSeconds = &durationSec
+			Expect(k8sClient.Update(ctx, lease)).To(Succeed())
+
+			// Transaction B: targets the same resource → should take over the expired lease.
+			txnB := minimalTxn("expiry-txn-b")
+			Expect(k8sClient.Create(ctx, txnB)).To(Succeed())
+			rcB := createChange("expiry-txn-b", "expiry-cm-change-b", changeSpec, txnB.UID)
+			Expect(k8sClient.Create(ctx, rcB)).To(Succeed())
+
+			reconcileToPhase(reconciler, "expiry-txn-b", backupv1alpha1.TransactionPhasePrepared)
+
+			// Verify the lease is now held by txn B.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: leaseName, Namespace: testNamespace,
+			}, lease)).To(Succeed())
+			Expect(*lease.Spec.HolderIdentity).To(Equal("expiry-txn-b"))
+
+			// Transaction A: Prepared → Committing → Renew fails (holder is B) → RollingBack → RolledBack.
+			reconcileToPhase(reconciler, "expiry-txn-a", backupv1alpha1.TransactionPhaseRolledBack)
+
+			// Assert: A is RolledBack, B is Prepared, lease held by B.
+			Expect(k8sClient.Get(ctx, nn("expiry-txn-a"), txnA)).To(Succeed())
+			Expect(txnA.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRolledBack))
+
+			Expect(k8sClient.Get(ctx, nn("expiry-txn-b"), txnB)).To(Succeed())
+			Expect(txnB.Status.Phase).To(Equal(backupv1alpha1.TransactionPhasePrepared))
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: leaseName, Namespace: testNamespace,
+			}, lease)).To(Succeed())
+			Expect(*lease.Spec.HolderIdentity).To(Equal("expiry-txn-b"))
+
+			// Clean up: commit B, delete CM.
+			reconcileToPhase(reconciler, "expiry-txn-b", backupv1alpha1.TransactionPhaseCommitted)
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
 	Context("when rolling back a Create (reverse = Delete the created resource)", func() {
 		It("should delete the created resource during rollback", func() {
 			// Item 0: Create a new ConfigMap (will be committed).
@@ -1102,7 +1194,7 @@ var _ = Describe("Transaction Controller", func() {
 		It("should release leases on deletion during Preparing", func() {
 			var releasedLeases []lock.LeaseRef
 			reconciler.LockMgr = &fakeLockMgr{
-				releaseAllFn: func(_ context.Context, leases []lock.LeaseRef) error {
+				releaseAllFn: func(_ context.Context, leases []lock.LeaseRef, _ string) error {
 					releasedLeases = leases
 					return nil
 				},

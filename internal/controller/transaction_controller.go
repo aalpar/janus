@@ -1167,7 +1167,7 @@ func (r *TransactionReconciler) collectLeaseRefs(txn *backupv1alpha1.Transaction
 func (r *TransactionReconciler) releaseAllLocks(ctx context.Context, txn *backupv1alpha1.Transaction) {
 	log := logf.FromContext(ctx)
 	leaseRefs := r.collectLeaseRefs(txn)
-	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs); err != nil {
+	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs, txn.Name); err != nil {
 		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
 		log.Error(err, "best-effort lease release failed")
 	} else {
