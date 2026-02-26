@@ -76,7 +76,7 @@ func runCreate(args []string) int {
 	lockTimeout := fs.String("lock-timeout", "", "per-resource lock timeout (e.g. 5m)")
 	timeout := fs.String("timeout", "", "overall transaction timeout (e.g. 30m)")
 	generateName := fs.StringP("generate-name", "g", "", "name prefix for server-generated name")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	hasName := fs.NArg() > 0
 	hasGenerate := *generateName != ""
@@ -133,7 +133,7 @@ func runCreate(args []string) int {
 		fmt.Fprintf(os.Stderr, "Error creating Transaction: %v\n", err)
 		return 1
 	}
-	fmt.Fprintln(os.Stdout, txn.Name)
+	_, _ = fmt.Fprintln(os.Stdout, txn.Name)
 	fmt.Fprintf(os.Stderr, "Transaction %s/%s created (unsealed)\n", txn.Namespace, txn.Name)
 	return 0
 }
@@ -149,10 +149,11 @@ func runAdd(args []string) int {
 	contentFile := fs.StringP("file", "f", "", "path to content YAML file")
 	order := fs.Int("order", 0, "execution order (lower executes first)")
 	changeName := fs.String("name", "", "ResourceChange name (auto-generated if omitted)")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: janus add <transaction-name> --type <Type> --target <Kind/Name> [-f content.yaml] [--order N] [-n namespace]\n")
+		fmt.Fprintf(os.Stderr, "Usage: janus add <transaction-name> --type <Type> --target <Kind/Name> "+
+			"[-f content.yaml] [--order N] [-n namespace]\n")
 		return 1
 	}
 	if *changeType == "" || *target == "" {
@@ -260,7 +261,7 @@ func runAdd(args []string) int {
 func runSeal(args []string) int {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	namespace := fs.StringP("namespace", "n", "default", "namespace")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
 		fmt.Fprintf(os.Stderr, "Usage: janus seal <transaction-name> [-n namespace]\n")
@@ -302,7 +303,7 @@ func runRecover(args []string) int {
 	fs := flag.NewFlagSet("recover "+subcmd, flag.ExitOnError)
 	namespace := fs.StringP("namespace", "n", "default", "namespace of the transaction")
 	force := fs.Bool("force", false, "force apply even on RV conflicts")
-	fs.Parse(args[1:])
+	_ = fs.Parse(args[1:])
 
 	if fs.NArg() == 0 {
 		fmt.Fprintf(os.Stderr, "Error: transaction name required\n")
