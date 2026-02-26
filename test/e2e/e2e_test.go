@@ -289,7 +289,7 @@ subjects:
 				Kind: "ConfigMap", Name: "created-cm", ChangeType: "Create",
 				Content: configMapYAML("created-cm", "key1: val1"),
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
 
@@ -309,7 +309,7 @@ subjects:
 				Kind: "ConfigMap", Name: "patch-target", ChangeType: "Patch",
 				Content: "data:\n  added: new-value",
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
 
@@ -332,7 +332,7 @@ subjects:
 			createTransactionWithChanges(txnName, txnChange{
 				Kind: "ConfigMap", Name: "delete-target", ChangeType: "Delete",
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
 
@@ -360,7 +360,7 @@ subjects:
 					Kind: "ConfigMap", Name: "multi-delete-target", ChangeType: "Delete",
 				},
 			)
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "multi-create-cm", testNS)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "multi-patch-target", testNS)
 
@@ -407,7 +407,7 @@ stringData:
   secret-key: secret-val`, testNS),
 				},
 			)
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "RolledBack")
 
@@ -435,7 +435,7 @@ stringData:
 				Kind: "ConfigMap", Name: "irrelevant", ChangeType: "Create",
 				Content: configMapYAML("irrelevant", "key: val"),
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Failed")
 
@@ -519,6 +519,15 @@ func kubectlApplyInput(yaml string) error {
 // kubectlDeleteIgnoreNotFound deletes the named resource, ignoring NotFound errors.
 func kubectlDeleteIgnoreNotFound(resource, name, ns string) {
 	_, _ = kubectl("delete", resource, name, "-n", ns, "--ignore-not-found")
+}
+
+// cleanupTransaction strips the user-managed rollback-protection finalizer
+// (which the controller never removes) and then deletes the transaction.
+func cleanupTransaction(name, ns string) {
+	// Patch out all finalizers — ignore errors (resource may already be gone).
+	_, _ = kubectl("patch", "transaction", name, "-n", ns,
+		"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
+	kubectlDeleteIgnoreNotFound("transaction", name, ns)
 }
 
 // waitForTransactionPhase polls until the Transaction reaches the expected phase.
