@@ -522,9 +522,11 @@ func kubectlDeleteIgnoreNotFound(resource, name, ns string) {
 }
 
 // cleanupTransaction strips the user-managed rollback-protection finalizer
-// (which the controller never removes) and then deletes the transaction.
+// and deletes the transaction. The controller won't re-add the finalizer once
+// deletion has started or the transaction is in a terminal phase.
 func cleanupTransaction(name, ns string) {
-	// Patch out all finalizers — ignore errors (resource may already be gone).
+	// Null out all finalizers (the controller won't re-add rollback-protection
+	// once deletionTimestamp is set or the phase is terminal).
 	_, _ = kubectl("patch", "transaction", name, "-n", ns,
 		"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
 	kubectlDeleteIgnoreNotFound("transaction", name, ns)

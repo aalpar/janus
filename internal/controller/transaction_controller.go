@@ -99,14 +99,16 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Ensure rollback-protection finalizer is present on every Transaction.
-	// Added early (before sealed check) so even unsealed transactions get it.
-	// handleDeletion removes it when safe (no unrolled commits or rollback succeeded).
-	if controllerutil.AddFinalizer(&txn, rollbackProtectionFinalizer) {
-		if err := r.Update(ctx, &txn); err != nil {
-			return ctrl.Result{}, err
+	// Ensure rollback-protection finalizer is present on non-terminal, non-deleting Transactions.
+	// This finalizer is user-managed: the controller adds it but never removes it.
+	// Once in a terminal phase or being deleted, don't re-add (the user may have removed it).
+	if txn.DeletionTimestamp.IsZero() && !isTerminalPhase(txn.Status.Phase) {
+		if controllerutil.AddFinalizer(&txn, rollbackProtectionFinalizer) {
+			if err := r.Update(ctx, &txn); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 		}
-		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
 	// Deletion in progress — phase-aware cleanup with rollback if needed.
