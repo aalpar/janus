@@ -378,22 +378,18 @@ func runRecoverApply(txnName, namespace string, force bool) int {
 		return 1
 	}
 
-	// Load rollback ConfigMap.
-	rbCMName := txnName + "-rollback"
-	rbCM := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: namespace}, rbCM); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: cannot find rollback ConfigMap %q in namespace %q: %v\n", rbCMName, namespace, err)
-		return 1
-	}
-
-	// Optionally load Transaction CR for status.
+	// Load Transaction CR for status and RollbackRef.
 	var txnItems map[string]recover.ItemStatusInfo
+	rbCMName := txnName + "-rollback" // fallback if Transaction CR is gone
 	txn := &backupv1alpha1.Transaction{}
 	if err := cl.Get(ctx, client.ObjectKey{Name: txnName, Namespace: namespace}, txn); err != nil {
 		if !apierrors.IsNotFound(err) {
 			fmt.Fprintf(os.Stderr, "Warning: cannot read Transaction %q: %v (proceeding from ConfigMap only)\n", txnName, err)
 		}
 	} else {
+		if txn.Status.RollbackRef != "" {
+			rbCMName = txn.Status.RollbackRef
+		}
 		txnItems = make(map[string]recover.ItemStatusInfo, len(txn.Status.Items))
 		for _, item := range txn.Status.Items {
 			txnItems[item.Name] = recover.ItemStatusInfo{
@@ -401,6 +397,13 @@ func runRecoverApply(txnName, namespace string, force bool) int {
 				RolledBack: item.RolledBack,
 			}
 		}
+	}
+
+	// Load rollback ConfigMap.
+	rbCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: namespace}, rbCM); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot find rollback ConfigMap %q in namespace %q: %v\n", rbCMName, namespace, err)
+		return 1
 	}
 
 	plan, err := recover.BuildPlan(rbCM, txnItems)
