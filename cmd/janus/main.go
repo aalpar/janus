@@ -216,7 +216,7 @@ func runAdd(args []string) int {
 	// Auto-generate name if not specified.
 	rcName := *changeName
 	if rcName == "" {
-		rcName = fmt.Sprintf("%s-%s-%s", txnName, strings.ToLower(*changeType), strings.ToLower(name))
+		rcName = fmt.Sprintf("%s-%s-%s", txn.Name, strings.ToLower(*changeType), strings.ToLower(name))
 	}
 
 	rc := &backupv1alpha1.ResourceChange{
@@ -224,7 +224,7 @@ func runAdd(args []string) int {
 			Name:      rcName,
 			Namespace: *namespace,
 			Labels: map[string]string{
-				"tx.janus.io/transaction": txnName,
+				"tx.janus.io/transaction": txn.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: backupv1alpha1.GroupVersion.String(),
