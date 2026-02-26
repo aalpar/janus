@@ -261,6 +261,20 @@ func (r *TransactionReconciler) getImpersonatingClient(ctx context.Context, txn 
 func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// Terminal phases — nothing left to protect or roll back.
+	switch txn.Status.Phase {
+	case backupv1alpha1.TransactionPhaseCommitted,
+		backupv1alpha1.TransactionPhaseRolledBack:
+		log.Info("deleting terminal transaction, releasing locks and removing finalizers")
+		r.releaseAllLocks(ctx, txn)
+		controllerutil.RemoveFinalizer(txn, finalizerName)
+		controllerutil.RemoveFinalizer(txn, rollbackProtectionFinalizer)
+		if err := r.Update(ctx, txn); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	if !r.hasUnrolledCommits(txn) {
 		log.Info("no unrolled commits, releasing locks and removing finalizers")
 		r.releaseAllLocks(ctx, txn)
