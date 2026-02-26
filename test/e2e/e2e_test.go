@@ -288,7 +288,7 @@ subjects:
 				"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
 
 			By("deleting the e2e test namespace")
-			_, _ = kubectl("delete", "ns", testNS, "--ignore-not-found")
+			_, _ = kubectl("delete", "ns", testNS, "--ignore-not-found", "--wait=false")
 		})
 
 		JustAfterEach(func() {
