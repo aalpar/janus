@@ -291,6 +291,15 @@ subjects:
 			_, _ = kubectl("delete", "ns", testNS, "--ignore-not-found")
 		})
 
+		JustAfterEach(func() {
+			if CurrentSpecReport().Failed() {
+				By("dumping controller logs for failed test")
+				logs, _ := kubectl("logs", "-l", "control-plane=controller-manager",
+					"-n", namespace, "--tail=100")
+				GinkgoWriter.Printf("\n=== Controller logs (last 100 lines) ===\n%s\n", logs)
+			}
+		})
+
 		It("should create a ConfigMap via Transaction", func() {
 			txnName := "e2e-create"
 			createTransactionWithChanges(txnName, txnChange{
@@ -543,9 +552,14 @@ func cleanupTransaction(name, ns string) {
 // waitForTransactionPhase polls until the Transaction reaches the expected phase.
 func waitForTransactionPhase(name, ns, phase string) {
 	By(fmt.Sprintf("waiting for Transaction %s/%s to reach phase %s", ns, name, phase))
+	var lastPhase string
 	Eventually(func(g Gomega) {
 		output, err := kubectlGetField("transaction", name, ns, "{.status.phase}")
 		g.Expect(err).NotTo(HaveOccurred())
+		if output != lastPhase {
+			By(fmt.Sprintf("  phase is now: %q (waiting for %q)", output, phase))
+			lastPhase = output
+		}
 		g.Expect(output).To(Equal(phase))
 	}, 2*time.Minute, time.Second).Should(Succeed())
 }
