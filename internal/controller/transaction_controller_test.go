@@ -2937,6 +2937,68 @@ var _ = Describe("Transaction Controller", func() {
 			// Clean up.
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
+
+		It("should treat Delete as satisfied when resource is already gone on retry", func() {
+			// Create a ConfigMap to delete.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "delete-retry-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "value"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			txn := minimalTxn("delete-retry-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("delete-retry-txn", "delete-retry-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "delete-retry-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+
+			// Reconcile through Prepared.
+			reconcileToPhase(reconciler, "delete-retry-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// Reconcile once to transition Prepared → Committing.
+			_, err := reconciler.Reconcile(ctx, req("delete-retry-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile again to actually commit (delete the CM).
+			_, err = reconciler.Reconcile(ctx, req("delete-retry-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify the item was committed and the CM is gone.
+			Expect(k8sClient.Get(ctx, nn("delete-retry-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+			Expect(apierrors.IsNotFound(
+				k8sClient.Get(ctx, nn("delete-retry-cm"), cm),
+			)).To(BeTrue())
+
+			// Simulate crash: revert Committed flag while the
+			// target resource remains deleted.
+			txn.Status.Items[0].Committed = false
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Retry — should recognize the Delete is satisfied and
+			// continue to Committed, not false-fail as conflict.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, nn("delete-retry-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed {
+					break
+				}
+				_, err = reconciler.Reconcile(ctx, req("delete-retry-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(k8sClient.Get(ctx, nn("delete-retry-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
+		})
 	})
 
 	Context("status conditions", func() {

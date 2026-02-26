@@ -772,6 +772,10 @@ func (r *TransactionReconciler) checkConflict(ctx context.Context, cl client.Cli
 	obj, err := r.getResource(ctx, cl, change.Target, ns)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			// Delete intent is satisfied by absence — no conflict.
+			if change.Type == backupv1alpha1.ChangeTypeDelete {
+				return errSelfWrite
+			}
 			return &ErrConflictDetected{Ref: change.Target, Expected: expectedRV}
 		}
 		return err
