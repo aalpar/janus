@@ -2999,6 +2999,85 @@ var _ = Describe("Transaction Controller", func() {
 			Expect(k8sClient.Get(ctx, nn("delete-retry-txn"), txn)).To(Succeed())
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
 		})
+
+		It("should re-apply Patch idempotently on crash-retry via SSA", func() {
+			// Create a ConfigMap to patch.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "patch-retry-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original", "other": "kept"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "patch-retry-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "patched"},
+			}
+			raw, err := json.Marshal(patchContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			txn := minimalTxn("patch-retry-txn")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createChange("patch-retry-txn", "patch-retry-cm-change", backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "patch-retry-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: raw},
+			}, txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+
+			// Reconcile through Prepared.
+			reconcileToPhase(reconciler, "patch-retry-txn", backupv1alpha1.TransactionPhasePrepared)
+
+			// Reconcile once to transition Prepared → Committing.
+			_, err = reconciler.Reconcile(ctx, req("patch-retry-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Reconcile again to actually commit (SSA patch the CM).
+			_, err = reconciler.Reconcile(ctx, req("patch-retry-txn"))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify the item was committed and the patch applied.
+			Expect(k8sClient.Get(ctx, nn("patch-retry-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Items[0].Committed).To(BeTrue())
+			Expect(k8sClient.Get(ctx, nn("patch-retry-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("patched"))
+			Expect(cm.Data["other"]).To(Equal("kept"))
+
+			// Simulate crash: revert Committed flag while the
+			// target resource already has the patched values.
+			txn.Status.Items[0].Committed = false
+			Expect(k8sClient.Status().Update(ctx, txn)).To(Succeed())
+
+			// Retry — SSA re-apply is idempotent, should reach Committed.
+			for range 10 {
+				Expect(k8sClient.Get(ctx, nn("patch-retry-txn"), txn)).To(Succeed())
+				if txn.Status.Phase == backupv1alpha1.TransactionPhaseCommitted ||
+					txn.Status.Phase == backupv1alpha1.TransactionPhaseFailed {
+					break
+				}
+				_, err = reconciler.Reconcile(ctx, req("patch-retry-txn"))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(k8sClient.Get(ctx, nn("patch-retry-txn"), txn)).To(Succeed())
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseCommitted))
+
+			// Verify patched values survived the retry.
+			Expect(k8sClient.Get(ctx, nn("patch-retry-cm"), cm)).To(Succeed())
+			Expect(cm.Data["key"]).To(Equal("patched"))
+			Expect(cm.Data["other"]).To(Equal("kept"))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
 	})
 
 	Context("status conditions", func() {
