@@ -70,6 +70,21 @@ multiple kubectl commands or API calls before committing to execution.
 janus create deploy-v2 --sa janus-txn [-n default]
 ```
 
+Or with a server-generated name:
+
+```sh
+TXN=$(janus create -g deploy- --sa janus-txn [-n default])
+```
+
+The resolved name is printed to stdout, making it easy to capture for
+subsequent commands:
+
+```sh
+TXN=$(janus create -g deploy- --sa janus-txn)
+janus add "$TXN" --type Patch --target ConfigMap/app-config -f patch.yaml
+janus seal "$TXN"
+```
+
 Or with kubectl:
 
 ```yaml
@@ -529,6 +544,23 @@ janus add deploy-v2 --type Delete --target Secret/old-api-key \
 
 # Seal to begin processing
 janus seal deploy-v2
+```
+
+With a generated name:
+
+```sh
+TXN=$(janus create -g deploy-v2- --sa janus-txn)
+
+janus add "$TXN" --type Patch --target ConfigMap/app-config \
+  -f config-patch.yaml
+
+janus add "$TXN" --type Patch --target Deployment/web-server \
+  -f deploy-patch.yaml --order 1
+
+janus add "$TXN" --type Delete --target Secret/old-api-key \
+  --order 2
+
+janus seal "$TXN"
 ```
 
 Or equivalently with kubectl (showing the ResourceChange YAML):
