@@ -618,6 +618,80 @@ var _ = Describe("Transaction Controller", func() {
 		})
 	})
 
+	Context("lease contention between two transactions", func() {
+		It("should fail the second transaction when the first holds the lock", func() {
+			// Target resource both transactions will contend over.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "contention-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"key": "original"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			patchContent := map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "contention-cm", "namespace": testNamespace},
+				"data":       map[string]any{"key": "patched"},
+			}
+			raw, err := json.Marshal(patchContent)
+			Expect(err).NotTo(HaveOccurred())
+
+			changeSpec := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "contention-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: raw},
+			}
+
+			// Transaction A: prepare with real lock manager → acquires lease.
+			txnA := minimalTxn("contention-txn-a")
+			Expect(k8sClient.Create(ctx, txnA)).To(Succeed())
+			rcA := createChange("contention-txn-a", "contention-cm-change-a", changeSpec, txnA.UID)
+			Expect(k8sClient.Create(ctx, rcA)).To(Succeed())
+
+			reconcileToPhase(reconciler, "contention-txn-a", backupv1alpha1.TransactionPhasePrepared)
+
+			// Verify the lease exists and is held by txn A.
+			lease := &coordinationv1.Lease{}
+			leaseName := lock.LeaseName(lock.ResourceKey{
+				Namespace: testNamespace, Kind: "ConfigMap", Name: "contention-cm",
+			})
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: leaseName, Namespace: testNamespace,
+			}, lease)).To(Succeed())
+			Expect(*lease.Spec.HolderIdentity).To(Equal("contention-txn-a"))
+
+			// Transaction B: targets the same resource → lock acquisition should fail.
+			txnB := minimalTxn("contention-txn-b")
+			Expect(k8sClient.Create(ctx, txnB)).To(Succeed())
+			rcB := createChange("contention-txn-b", "contention-cm-change-b", changeSpec, txnB.UID)
+			Expect(k8sClient.Create(ctx, rcB)).To(Succeed())
+
+			// Drive B through to Preparing, then let it hit the lock.
+			reconcileToPhase(reconciler, "contention-txn-b", backupv1alpha1.TransactionPhasePreparing)
+			_, err = reconciler.Reconcile(ctx, req("contention-txn-b"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("contention-txn-b"), txnB)).To(Succeed())
+			Expect(txnB.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseFailed))
+
+			// Transaction A should still be Prepared, unaffected.
+			Expect(k8sClient.Get(ctx, nn("contention-txn-a"), txnA)).To(Succeed())
+			Expect(txnA.Status.Phase).To(Equal(backupv1alpha1.TransactionPhasePrepared))
+
+			// Clean up: commit A so leases are released, then delete CM.
+			reconcileToPhase(reconciler, "contention-txn-a", backupv1alpha1.TransactionPhaseCommitted)
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
 	Context("when rolling back a Create (reverse = Delete the created resource)", func() {
 		It("should delete the created resource during rollback", func() {
 			// Item 0: Create a new ConfigMap (will be committed).
