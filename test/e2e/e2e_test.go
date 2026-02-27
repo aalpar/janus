@@ -88,6 +88,11 @@ var _ = Describe("Manager", Ordered, func() {
 		By("removing metrics ClusterRoleBinding")
 		_, _ = kubectl("delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
 
+		By("stripping finalizers from all transactions cluster-wide")
+		// CRD deletion blocks on instances with finalizers.
+		_, _ = kubectl("patch", "transactions", "--all-namespaces", "--all",
+			"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
+
 		By("undeploying the controller-manager")
 		cmd := exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
