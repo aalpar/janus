@@ -38,6 +38,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	sigsyaml "sigs.k8s.io/yaml"
@@ -228,10 +229,12 @@ func runAdd(args []string) int {
 				"tx.janus.io/transaction": txn.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: backupv1alpha1.GroupVersion.String(),
-				Kind:       "Transaction",
-				Name:       txn.Name,
-				UID:        txn.UID,
+				APIVersion:         backupv1alpha1.GroupVersion.String(),
+				Kind:               "Transaction",
+				Name:               txn.Name,
+				UID:                txn.UID,
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
 			}},
 		},
 		Spec: backupv1alpha1.ResourceChangeSpec{

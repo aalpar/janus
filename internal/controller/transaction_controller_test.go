@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -4395,10 +4396,12 @@ func createChange(txnName, changeName string, spec backupv1alpha1.ResourceChange
 			Name:      changeName,
 			Namespace: testNamespace,
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: backupv1alpha1.GroupVersion.String(),
-				Kind:       "Transaction",
-				Name:       txnName,
-				UID:        txnUID,
+				APIVersion:         backupv1alpha1.GroupVersion.String(),
+				Kind:               "Transaction",
+				Name:               txnName,
+				UID:                txnUID,
+				Controller:         ptr.To(true),
+				BlockOwnerDeletion: ptr.To(true),
 			}},
 		},
 		Spec: spec,
