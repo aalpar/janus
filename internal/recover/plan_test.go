@@ -69,7 +69,7 @@ func TestBuildPlan_PendingRollback(t *testing.T) {
 	if item.Status != StatusPending {
 		t.Errorf("expected status pending, got %s", item.Status)
 	}
-	if item.Operation != "RESTORE" {
+	if item.Operation != "RESTORE" { //nolint:goconst // test data
 		t.Errorf("expected operation RESTORE, got %s", item.Operation)
 	}
 	if item.StoredRV != "100" {
@@ -104,7 +104,7 @@ func TestBuildPlan_CreateIsDelete(t *testing.T) {
 		t.Fatalf("BuildPlan returned error: %v", err)
 	}
 	item := plan.Items[0]
-	if item.Operation != "DELETE" {
+	if item.Operation != "DELETE" { //nolint:goconst // test data
 		t.Errorf("expected operation DELETE, got %s", item.Operation)
 	}
 	if item.StoredRV != "" {

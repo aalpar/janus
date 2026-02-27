@@ -75,34 +75,36 @@ func runCreate(args []string) int {
 	sa := fs.String("sa", "", "service account name (required)")
 	lockTimeout := fs.String("lock-timeout", "", "per-resource lock timeout (e.g. 5m)")
 	timeout := fs.String("timeout", "", "overall transaction timeout (e.g. 30m)")
-	fs.Parse(args)
+	generateName := fs.StringP("generate-name", "g", "", "name prefix for server-generated name")
+	_ = fs.Parse(args)
 
-	if fs.NArg() == 0 {
+	hasName := fs.NArg() > 0
+	hasGenerate := *generateName != ""
+	if hasName == hasGenerate {
 		fmt.Fprintf(os.Stderr, "Usage: janus create <name> --sa <service-account> [-n namespace]\n")
+		fmt.Fprintf(os.Stderr, "       janus create -g <prefix> --sa <service-account> [-n namespace]\n")
+		fmt.Fprintf(os.Stderr, "\nProvide either a name or --generate-name, not both.\n")
 		return 1
 	}
 	if *sa == "" {
 		fmt.Fprintf(os.Stderr, "Error: --sa is required\n")
 		return 1
 	}
-	txnName := fs.Arg(0)
-
-	ctx := context.Background()
-	cl, err := buildClient()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
-		return 1
-	}
 
 	txn := &backupv1alpha1.Transaction{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      txnName,
 			Namespace: *namespace,
 		},
 		Spec: backupv1alpha1.TransactionSpec{
 			ServiceAccountName: *sa,
 		},
 	}
+	if hasName {
+		txn.Name = fs.Arg(0)
+	} else {
+		txn.GenerateName = *generateName
+	}
+
 	if *lockTimeout != "" {
 		d, err := parseDuration(*lockTimeout)
 		if err != nil {
@@ -120,11 +122,19 @@ func runCreate(args []string) int {
 		txn.Spec.Timeout = d
 	}
 
+	ctx := context.Background()
+	cl, err := buildClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error building client: %v\n", err)
+		return 1
+	}
+
 	if err := cl.Create(ctx, txn); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating Transaction: %v\n", err)
 		return 1
 	}
-	fmt.Printf("Transaction %s/%s created (unsealed)\n", txn.Namespace, txn.Name)
+	_, _ = fmt.Fprintln(os.Stdout, txn.Name)
+	fmt.Fprintf(os.Stderr, "Transaction %s/%s created (unsealed)\n", txn.Namespace, txn.Name)
 	return 0
 }
 
@@ -139,10 +149,11 @@ func runAdd(args []string) int {
 	contentFile := fs.StringP("file", "f", "", "path to content YAML file")
 	order := fs.Int("order", 0, "execution order (lower executes first)")
 	changeName := fs.String("name", "", "ResourceChange name (auto-generated if omitted)")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: janus add <transaction-name> --type <Type> --target <Kind/Name> [-f content.yaml] [--order N] [-n namespace]\n")
+		fmt.Fprintf(os.Stderr, "Usage: janus add <transaction-name> --type <Type> --target <Kind/Name> "+
+			"[-f content.yaml] [--order N] [-n namespace]\n")
 		return 1
 	}
 	if *changeType == "" || *target == "" {
@@ -206,7 +217,7 @@ func runAdd(args []string) int {
 	// Auto-generate name if not specified.
 	rcName := *changeName
 	if rcName == "" {
-		rcName = fmt.Sprintf("%s-%s-%s", txnName, strings.ToLower(*changeType), strings.ToLower(name))
+		rcName = fmt.Sprintf("%s-%s-%s", txn.Name, strings.ToLower(*changeType), strings.ToLower(name))
 	}
 
 	rc := &backupv1alpha1.ResourceChange{
@@ -214,7 +225,7 @@ func runAdd(args []string) int {
 			Name:      rcName,
 			Namespace: *namespace,
 			Labels: map[string]string{
-				"tx.janus.io/transaction": txnName,
+				"tx.janus.io/transaction": txn.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: backupv1alpha1.GroupVersion.String(),
@@ -250,7 +261,7 @@ func runAdd(args []string) int {
 func runSeal(args []string) int {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	namespace := fs.StringP("namespace", "n", "default", "namespace")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
 		fmt.Fprintf(os.Stderr, "Usage: janus seal <transaction-name> [-n namespace]\n")
@@ -292,7 +303,7 @@ func runRecover(args []string) int {
 	fs := flag.NewFlagSet("recover "+subcmd, flag.ExitOnError)
 	namespace := fs.StringP("namespace", "n", "default", "namespace of the transaction")
 	force := fs.Bool("force", false, "force apply even on RV conflicts")
-	fs.Parse(args[1:])
+	_ = fs.Parse(args[1:])
 
 	if fs.NArg() == 0 {
 		fmt.Fprintf(os.Stderr, "Error: transaction name required\n")
@@ -319,22 +330,18 @@ func runRecoverPlan(txnName, namespace string) int {
 		return 1
 	}
 
-	// Load rollback ConfigMap.
-	rbCMName := txnName + "-rollback"
-	rbCM := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: namespace}, rbCM); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: cannot find rollback ConfigMap %q in namespace %q: %v\n", rbCMName, namespace, err)
-		return 1
-	}
-
-	// Optionally load Transaction CR for status.
+	// Load Transaction CR for status and RollbackRef.
 	var txnItems map[string]recover.ItemStatusInfo
+	rbCMName := txnName + "-rollback" // fallback if Transaction CR is gone
 	txn := &backupv1alpha1.Transaction{}
 	if err := cl.Get(ctx, client.ObjectKey{Name: txnName, Namespace: namespace}, txn); err != nil {
 		if !apierrors.IsNotFound(err) {
 			fmt.Fprintf(os.Stderr, "Warning: cannot read Transaction %q: %v (proceeding from ConfigMap only)\n", txnName, err)
 		}
 	} else {
+		if txn.Status.RollbackRef != "" {
+			rbCMName = txn.Status.RollbackRef
+		}
 		txnItems = make(map[string]recover.ItemStatusInfo, len(txn.Status.Items))
 		for _, item := range txn.Status.Items {
 			txnItems[item.Name] = recover.ItemStatusInfo{
@@ -342,6 +349,13 @@ func runRecoverPlan(txnName, namespace string) int {
 				RolledBack: item.RolledBack,
 			}
 		}
+	}
+
+	// Load rollback ConfigMap.
+	rbCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: namespace}, rbCM); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot find rollback ConfigMap %q in namespace %q: %v\n", rbCMName, namespace, err)
+		return 1
 	}
 
 	plan, err := recover.BuildPlan(rbCM, txnItems)
@@ -365,22 +379,18 @@ func runRecoverApply(txnName, namespace string, force bool) int {
 		return 1
 	}
 
-	// Load rollback ConfigMap.
-	rbCMName := txnName + "-rollback"
-	rbCM := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: namespace}, rbCM); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: cannot find rollback ConfigMap %q in namespace %q: %v\n", rbCMName, namespace, err)
-		return 1
-	}
-
-	// Optionally load Transaction CR for status.
+	// Load Transaction CR for status and RollbackRef.
 	var txnItems map[string]recover.ItemStatusInfo
+	rbCMName := txnName + "-rollback" // fallback if Transaction CR is gone
 	txn := &backupv1alpha1.Transaction{}
 	if err := cl.Get(ctx, client.ObjectKey{Name: txnName, Namespace: namespace}, txn); err != nil {
 		if !apierrors.IsNotFound(err) {
 			fmt.Fprintf(os.Stderr, "Warning: cannot read Transaction %q: %v (proceeding from ConfigMap only)\n", txnName, err)
 		}
 	} else {
+		if txn.Status.RollbackRef != "" {
+			rbCMName = txn.Status.RollbackRef
+		}
 		txnItems = make(map[string]recover.ItemStatusInfo, len(txn.Status.Items))
 		for _, item := range txn.Status.Items {
 			txnItems[item.Name] = recover.ItemStatusInfo{
@@ -388,6 +398,13 @@ func runRecoverApply(txnName, namespace string, force bool) int {
 				RolledBack: item.RolledBack,
 			}
 		}
+	}
+
+	// Load rollback ConfigMap.
+	rbCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: rbCMName, Namespace: namespace}, rbCM); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot find rollback ConfigMap %q in namespace %q: %v\n", rbCMName, namespace, err)
+		return 1
 	}
 
 	plan, err := recover.BuildPlan(rbCM, txnItems)

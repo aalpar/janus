@@ -88,6 +88,11 @@ var _ = Describe("Manager", Ordered, func() {
 		By("removing metrics ClusterRoleBinding")
 		_, _ = kubectl("delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
 
+		By("stripping finalizers from all transactions cluster-wide")
+		// CRD deletion blocks on instances with finalizers.
+		_, _ = kubectl("patch", "transactions", "--all-namespaces", "--all",
+			"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
+
 		By("undeploying the controller-manager")
 		cmd := exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
@@ -260,6 +265,9 @@ rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get","list","watch","create","update","patch","delete"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get","list","watch"]
 `, testNS))).To(Succeed())
 
 			Expect(kubectlApplyInput(fmt.Sprintf(`apiVersion: rbac.authorization.k8s.io/v1
@@ -279,8 +287,22 @@ subjects:
 		})
 
 		AfterAll(func() {
+			By("stripping finalizers from any remaining transactions")
+			// Prevents namespace deletion from blocking on leftover finalizers.
+			_, _ = kubectl("patch", "transactions", "-n", testNS, "--all",
+				"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
+
 			By("deleting the e2e test namespace")
-			_, _ = kubectl("delete", "ns", testNS, "--ignore-not-found")
+			_, _ = kubectl("delete", "ns", testNS, "--ignore-not-found", "--wait=false")
+		})
+
+		JustAfterEach(func() {
+			if CurrentSpecReport().Failed() {
+				By("dumping controller logs for failed test")
+				logs, _ := kubectl("logs", "-l", "control-plane=controller-manager",
+					"-n", namespace, "--tail=100")
+				GinkgoWriter.Printf("\n=== Controller logs (last 100 lines) ===\n%s\n", logs)
+			}
 		})
 
 		It("should create a ConfigMap via Transaction", func() {
@@ -289,7 +311,7 @@ subjects:
 				Kind: "ConfigMap", Name: "created-cm", ChangeType: "Create",
 				Content: configMapYAML("created-cm", "key1: val1"),
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
 
@@ -309,7 +331,7 @@ subjects:
 				Kind: "ConfigMap", Name: "patch-target", ChangeType: "Patch",
 				Content: "data:\n  added: new-value",
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
 
@@ -332,7 +354,7 @@ subjects:
 			createTransactionWithChanges(txnName, txnChange{
 				Kind: "ConfigMap", Name: "delete-target", ChangeType: "Delete",
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Committed")
 
@@ -360,7 +382,7 @@ subjects:
 					Kind: "ConfigMap", Name: "multi-delete-target", ChangeType: "Delete",
 				},
 			)
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "multi-create-cm", testNS)
 			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "multi-patch-target", testNS)
 
@@ -407,7 +429,7 @@ stringData:
   secret-key: secret-val`, testNS),
 				},
 			)
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "RolledBack")
 
@@ -435,7 +457,7 @@ stringData:
 				Kind: "ConfigMap", Name: "irrelevant", ChangeType: "Create",
 				Content: configMapYAML("irrelevant", "key: val"),
 			})
-			DeferCleanup(kubectlDeleteIgnoreNotFound, "transaction", txnName, testNS)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
 
 			waitForTransactionPhase(txnName, testNS, "Failed")
 
@@ -521,12 +543,28 @@ func kubectlDeleteIgnoreNotFound(resource, name, ns string) {
 	_, _ = kubectl("delete", resource, name, "-n", ns, "--ignore-not-found")
 }
 
+// cleanupTransaction strips the user-managed rollback-protection finalizer
+// and deletes the transaction. The controller won't re-add the finalizer once
+// deletion has started or the transaction is in a terminal phase.
+func cleanupTransaction(name, ns string) {
+	// Null out all finalizers (the controller won't re-add rollback-protection
+	// once deletionTimestamp is set or the phase is terminal).
+	_, _ = kubectl("patch", "transaction", name, "-n", ns,
+		"--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
+	kubectlDeleteIgnoreNotFound("transaction", name, ns)
+}
+
 // waitForTransactionPhase polls until the Transaction reaches the expected phase.
 func waitForTransactionPhase(name, ns, phase string) {
 	By(fmt.Sprintf("waiting for Transaction %s/%s to reach phase %s", ns, name, phase))
+	var lastPhase string
 	Eventually(func(g Gomega) {
 		output, err := kubectlGetField("transaction", name, ns, "{.status.phase}")
 		g.Expect(err).NotTo(HaveOccurred())
+		if output != lastPhase {
+			By(fmt.Sprintf("  phase is now: %q (waiting for %q)", output, phase))
+			lastPhase = output
+		}
 		g.Expect(output).To(Equal(phase))
 	}, 2*time.Minute, time.Second).Should(Succeed())
 }
