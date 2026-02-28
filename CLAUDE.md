@@ -25,7 +25,7 @@ Pending → Preparing → Prepared → Committing → Committed
 
 ### CRDs
 
-**Transaction** — orchestrator CR. Key spec fields: `serviceAccountName`, `sealed`, `lockTimeout`, `timeout`, `generateName`. Status tracks `phase`, `version` (stale-write detection), `items[]` (per-resource progress), `rollbackRef` (ConfigMap name).
+**Transaction** — orchestrator CR. Key spec fields: `serviceAccountName`, `sealed`, `lockTimeout`, `timeout`. Supports `metadata.generateName` for server-generated names. Status tracks `phase`, `version` (stale-write detection), `items[]` (per-resource progress), `rollbackRef` (ConfigMap name).
 
 **ResourceChange** — individual mutation. Key spec fields: `target` (apiVersion/kind/name/namespace), `type` (Create|Update|Patch|Delete), `content` (manifest/patch JSON), `order` (execution sequence). Grouped under Transaction via OwnerReferences; sorted by `(spec.order, name)`.
 
