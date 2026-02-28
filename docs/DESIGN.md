@@ -2,6 +2,9 @@
 
 Architecture, state machine, and implementation details for Janus.
 
+See also: **[Invariants](INVARIANTS.md)** — safety, liveness, and boundary
+guarantees.
+
 ## Background
 
 ### Kubernetes' design philosophy
