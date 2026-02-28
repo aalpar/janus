@@ -256,6 +256,16 @@ func (r *TransactionReconciler) getImpersonatingClient(ctx context.Context, txn 
 	return entry.cl, nil
 }
 
+// cleanupAndReturn releases all locks, removes the lease-cleanup finalizer, and persists.
+func (r *TransactionReconciler) cleanupAndReturn(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
+	r.releaseAllLocks(ctx, txn)
+	controllerutil.RemoveFinalizer(txn, finalizerName)
+	if err := r.Update(ctx, txn); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
 // handleDeletion runs when a Transaction's DeletionTimestamp is set.
 // It performs phase-aware cleanup: if committed changes haven't been rolled
 // back, it initiates rollback (controlled by the automatic-rollback and
@@ -269,12 +279,7 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 	case backupv1alpha1.TransactionPhaseCommitted,
 		backupv1alpha1.TransactionPhaseRolledBack:
 		log.Info("deleting terminal transaction, releasing locks and removing finalizer")
-		r.releaseAllLocks(ctx, txn)
-		controllerutil.RemoveFinalizer(txn, finalizerName)
-		if err := r.Update(ctx, txn); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+		return r.cleanupAndReturn(ctx, txn)
 
 	case backupv1alpha1.TransactionPhaseRollingBack:
 		// Rollback in progress — let it complete (even if all items are already rolled back,
@@ -288,12 +293,7 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 
 	if !r.hasUnrolledCommits(txn) {
 		log.Info("no unrolled commits, releasing locks and removing finalizer")
-		r.releaseAllLocks(ctx, txn)
-		controllerutil.RemoveFinalizer(txn, finalizerName)
-		if err := r.Update(ctx, txn); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+		return r.cleanupAndReturn(ctx, txn)
 	}
 
 	// Has unrolled commits from here down.
@@ -317,26 +317,12 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 			r.event(txn, corev1.EventTypeWarning, "ProtectedState",
 				"transaction has unrolled commits but no rollback annotation; remove %s finalizer to force-delete",
 				rollbackProtectionFinalizer)
-			r.releaseAllLocks(ctx, txn)
-			controllerutil.RemoveFinalizer(txn, finalizerName)
-			if err := r.Update(ctx, txn); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
+			return r.cleanupAndReturn(ctx, txn)
 		}
 		// automatic-rollback present on a Failed transaction during deletion → retry.
 		log.Info("automatic-rollback present, retrying rollback")
 		return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
 
-	case backupv1alpha1.TransactionPhaseRolledBack:
-		// Rollback completed during deletion.
-		log.Info("rollback completed during deletion, cleaning up")
-		r.releaseAllLocks(ctx, txn)
-		controllerutil.RemoveFinalizer(txn, finalizerName)
-		if err := r.Update(ctx, txn); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
 	}
 
 	// Any other phase with unrolled commits (Committing, Preparing, etc.)
@@ -355,12 +341,7 @@ func (r *TransactionReconciler) handleDeletion(ctx context.Context, txn *backupv
 	r.event(txn, corev1.EventTypeWarning, "ProtectedState",
 		"transaction has unrolled commits but automatic-rollback absent; remove %s finalizer to force-delete",
 		rollbackProtectionFinalizer)
-	r.releaseAllLocks(ctx, txn)
-	controllerutil.RemoveFinalizer(txn, finalizerName)
-	if err := r.Update(ctx, txn); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{}, nil
+	return r.cleanupAndReturn(ctx, txn)
 }
 
 // handlePending initializes the transaction status and creates the rollback ConfigMap.
@@ -498,22 +479,9 @@ func (r *TransactionReconciler) handlePreparing(ctx context.Context, txn *backup
 			}
 			if apierrors.IsNotFound(err) {
 				// Resource doesn't exist — rollback will delete.
-				env := rollback.Envelope{ChangeType: string(change.Type)}
-				envData, mErr := json.Marshal(env)
-				if mErr != nil {
-					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: serializing create envelope: %v", rc.Name, mErr))
-				}
-				cm := &corev1.ConfigMap{}
-				if gErr := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, cm); gErr != nil {
-					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: fetching rollback ConfigMap: %v", rc.Name, gErr))
-				}
-				if cm.Data == nil {
-					cm.Data = make(map[string]string)
-				}
-				rbKey := rollback.Key(change.Target.Kind, ns, change.Target.Name)
-				cm.Data[rbKey] = string(envData)
-				if uErr := r.Update(ctx, cm); uErr != nil {
-					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving create envelope: %v", rc.Name, uErr))
+				if err := r.saveRollbackState(ctx, txn, change, nil); err != nil {
+					txmetrics.ItemOperations.WithLabelValues("prepare", "error").Inc()
+					return ctrl.Result{}, r.failAndReleaseLocks(ctx, txn, fmt.Sprintf("%s: saving rollback state: %v", rc.Name, err))
 				}
 			} else {
 				// Resource exists — save prior state so rollback restores it.
@@ -1138,13 +1106,19 @@ func (r *TransactionReconciler) saveRollbackState(ctx context.Context, txn *back
 	ns := r.resolveNamespace(change.Target, txn.Namespace)
 	key := rollback.Key(change.Target.Kind, ns, change.Target.Name)
 
-	priorState, err := json.Marshal(obj.Object)
-	if err != nil {
-		return &ResourceOpError{Op: "serializing rollback state", Err: err}
+	var priorState json.RawMessage
+	var rv string
+	if obj != nil {
+		var err error
+		priorState, err = json.Marshal(obj.Object)
+		if err != nil {
+			return &ResourceOpError{Op: "serializing rollback state", Err: err}
+		}
+		rv = obj.GetResourceVersion()
 	}
 
 	env := rollback.Envelope{
-		ResourceVersion: obj.GetResourceVersion(),
+		ResourceVersion: rv,
 		ChangeType:      string(change.Type),
 		PriorState:      priorState,
 	}
@@ -1185,21 +1159,16 @@ func (r *TransactionReconciler) transactionTimeout(txn *backupv1alpha1.Transacti
 	return defaultTransactionTimeout
 }
 
-func (r *TransactionReconciler) collectLeaseRefs(txn *backupv1alpha1.Transaction) []lock.LeaseRef {
+// releaseAllLocks releases all leases for a transaction (best-effort) and records metrics.
+func (r *TransactionReconciler) releaseAllLocks(ctx context.Context, txn *backupv1alpha1.Transaction) {
+	log := logf.FromContext(ctx)
 	refs := make([]lock.LeaseRef, 0, len(txn.Status.Items))
 	for _, item := range txn.Status.Items {
 		if item.LockLease != "" {
 			refs = append(refs, lock.LeaseRef{Name: item.LockLease, Namespace: item.LeaseNamespace})
 		}
 	}
-	return refs
-}
-
-// releaseAllLocks releases all leases for a transaction (best-effort) and records metrics.
-func (r *TransactionReconciler) releaseAllLocks(ctx context.Context, txn *backupv1alpha1.Transaction) {
-	log := logf.FromContext(ctx)
-	leaseRefs := r.collectLeaseRefs(txn)
-	if err := r.LockMgr.ReleaseAll(ctx, leaseRefs, txn.Name); err != nil {
+	if err := r.LockMgr.ReleaseAll(ctx, refs, txn.Name); err != nil {
 		txmetrics.LockOperations.WithLabelValues("release", "error").Inc()
 		log.Error(err, "best-effort lease release failed")
 	} else {
