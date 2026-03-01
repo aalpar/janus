@@ -40,7 +40,8 @@ Pending → Preparing → Prepared → Committing → Committed
 ### Annotations & Finalizers
 
 - `tx.janus.io/automatic-rollback` — present by default; remove to skip rollback on Transaction deletion
-- `tx.janus.io/retry-rollback` — one-shot trigger; controller removes after attempt
+- `tx.janus.io/retry-rollback` — one-shot trigger for Failed transactions; controller removes after attempt
+- `tx.janus.io/request-rollback` — one-shot trigger for Committed transactions; controller removes and transitions to RollingBack
 - `tx.janus.io/lease-cleanup` — controller-managed finalizer; stripped in terminal states
 - `tx.janus.io/rollback-protection` — controller adds, never removes; user strips to allow deletion
 

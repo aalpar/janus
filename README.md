@@ -139,7 +139,9 @@ partial update is worse than no update. Examples:
 
 ## Documentation
 
-- **[User Guide](docs/USER_GUIDE.md)** — full walkthrough: change types, ordering,
+- **[Tutorial](docs/TUTORIAL.md)** — hands-on walkthrough: create, rollback,
+  and recover transactions using both the CLI and kubectl.
+- **[User Guide](docs/USER_GUIDE.md)** — complete reference: change types, ordering,
   monitoring, failure handling, recovery.
 - **[Design](docs/DESIGN.md)** — architecture, state machine, lock manager,
   rollback storage, reconciliation loop.

@@ -44,9 +44,10 @@ import (
 )
 
 const (
-	testNamespace = "default"
-	testSAName    = "janus-test-sa"
-	unprivSAName  = "janus-unpriv-sa"
+	testNamespace   = "default"
+	testSAName      = "janus-test-sa"
+	unprivSAName    = "janus-unpriv-sa"
+	annotationValue = "true"
 )
 
 // fakeLockMgr is a controllable mock for lock.Manager used to trigger rollback paths.
@@ -1445,7 +1446,7 @@ var _ = Describe("Transaction Controller", func() {
 			if txn.Annotations == nil {
 				txn.Annotations = make(map[string]string)
 			}
-			txn.Annotations[annotationAutoRollback] = "true"
+			txn.Annotations[annotationAutoRollback] = annotationValue
 			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
 
 			// Reconcile until terminal, then simulate user removing rollback-protection.
@@ -1491,7 +1492,7 @@ var _ = Describe("Transaction Controller", func() {
 					Namespace:  testNamespace,
 					Finalizers: []string{finalizerName, rollbackProtectionFinalizer},
 					Annotations: map[string]string{
-						annotationRetryRollback: "true",
+						annotationRetryRollback: annotationValue,
 					},
 				},
 				Spec: backupv1alpha1.TransactionSpec{
@@ -1517,6 +1518,34 @@ var _ = Describe("Transaction Controller", func() {
 
 			Expect(k8sClient.Get(ctx, nn("del-retry-failed-txn"), txn)).To(Succeed())
 			Expect(txn.Annotations).NotTo(HaveKey(annotationRetryRollback))
+			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
+		})
+
+		It("should roll back a committed transaction when request-rollback annotation is set", func() {
+			reconciler.LockMgr = &fakeLockMgr{}
+
+			txn := minimalTxn("req-rb-committed")
+			Expect(k8sClient.Create(ctx, txn)).To(Succeed())
+			rc := createCMChange("req-rb-committed", "req-rb-committed-cm", txn.UID)
+			Expect(k8sClient.Create(ctx, rc)).To(Succeed())
+
+			// Drive to Committed.
+			reconcileToPhase(reconciler, "req-rb-committed", backupv1alpha1.TransactionPhaseCommitted)
+
+			// Add request-rollback annotation.
+			Expect(k8sClient.Get(ctx, nn("req-rb-committed"), txn)).To(Succeed())
+			if txn.Annotations == nil {
+				txn.Annotations = make(map[string]string)
+			}
+			txn.Annotations[annotationRequestRollback] = annotationValue
+			Expect(k8sClient.Update(ctx, txn)).To(Succeed())
+
+			// Reconcile: terminal handler sees request-rollback → removes annotation, transitions to RollingBack.
+			_, err := reconciler.Reconcile(ctx, req("req-rb-committed"))
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, nn("req-rb-committed"), txn)).To(Succeed())
+			Expect(txn.Annotations).NotTo(HaveKey(annotationRequestRollback))
 			Expect(txn.Status.Phase).To(Equal(backupv1alpha1.TransactionPhaseRollingBack))
 		})
 

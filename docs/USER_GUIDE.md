@@ -485,6 +485,25 @@ errors (e.g. a brief API server unavailability during rollback).
 
 No action required — the controller retries on each reconcile.
 
+### Rolling back a committed transaction
+
+A committed transaction can be rolled back by adding the
+`request-rollback` annotation:
+
+```sh
+kubectl annotate transaction deploy-v2 tx.janus.io/request-rollback=true
+```
+
+The controller consumes the annotation and transitions the transaction
+from `Committed` to `RollingBack`. The standard rollback machinery
+handles the rest — RV conflict detection, per-item progress, and the
+`Failed`-with-conflicts terminal state if any items can't be reverted.
+
+If all items roll back cleanly, the transaction reaches `RolledBack`.
+If any items conflict (the resource was modified externally since
+commit), those items are skipped and the transaction lands in `Failed`.
+Use `janus recover` to handle the remaining items.
+
 ### Manual recovery with `janus recover`
 
 For conflict cases where automatic rollback can't proceed (the resource was

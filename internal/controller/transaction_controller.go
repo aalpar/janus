@@ -56,6 +56,7 @@ const (
 	rollbackProtectionFinalizer = "tx.janus.io/rollback-protection"
 	annotationAutoRollback      = backupv1alpha1.AnnotationAutoRollback
 	annotationRetryRollback     = backupv1alpha1.AnnotationRetryRollback
+	annotationRequestRollback   = backupv1alpha1.AnnotationRequestRollback
 )
 
 // cachedClient holds a lazily-initialized impersonating client.
@@ -117,39 +118,9 @@ func (r *TransactionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.handleDeletion(ctx, &txn)
 	}
 
-	// Terminal states — strip finalizers so subsequent deletes are instant.
-	switch txn.Status.Phase {
-	case backupv1alpha1.TransactionPhaseCommitted,
-		backupv1alpha1.TransactionPhaseRolledBack:
-		changed := controllerutil.RemoveFinalizer(&txn, finalizerName)
-		// rollbackProtectionFinalizer is user-managed; the controller never removes it.
-		if changed {
-			if err := r.Update(ctx, &txn); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{}, nil
-	case backupv1alpha1.TransactionPhaseFailed:
-		if r.hasUnrolledCommits(&txn) {
-			rbCM := &corev1.ConfigMap{}
-			if err := r.Get(ctx, client.ObjectKey{
-				Name: txn.Status.RollbackRef, Namespace: txn.Namespace,
-			}, rbCM); err == nil {
-				log.Info("recovering failed transaction with un-rolled-back commits")
-				r.event(&txn, corev1.EventTypeWarning, "RecoveryInitiated", "recovering failed transaction with un-rolled-back commits")
-				return r.transition(ctx, &txn, backupv1alpha1.TransactionPhaseRollingBack)
-			}
-			log.Info("cannot recover: rollback ConfigMap missing")
-			r.event(&txn, corev1.EventTypeWarning, "RecoveryBlocked", "cannot recover: rollback ConfigMap %q missing", txn.Status.RollbackRef)
-		}
-		changed := controllerutil.RemoveFinalizer(&txn, finalizerName)
-		// rollbackProtectionFinalizer is user-managed; the controller never removes it.
-		if changed {
-			if err := r.Update(ctx, &txn); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{}, nil
+	// Terminal states — handle annotation-triggered rollback, auto-recovery, and finalizer cleanup.
+	if isTerminalPhase(txn.Status.Phase) {
+		return r.handleTerminal(ctx, &txn)
 	}
 
 	// Ignore unsealed transactions that haven't started processing.
@@ -262,6 +233,51 @@ func (r *TransactionReconciler) cleanupAndReturn(ctx context.Context, txn *backu
 	controllerutil.RemoveFinalizer(txn, finalizerName)
 	if err := r.Update(ctx, txn); err != nil {
 		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// handleTerminal runs for transactions in a terminal phase (Committed, RolledBack, Failed).
+// It handles annotation-triggered rollback for Committed transactions, auto-recovery for
+// Failed transactions with un-rolled-back commits, and lease-cleanup finalizer removal.
+func (r *TransactionReconciler) handleTerminal(ctx context.Context, txn *backupv1alpha1.Transaction) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	switch txn.Status.Phase {
+	case backupv1alpha1.TransactionPhaseCommitted:
+		// Check for user-requested rollback before settling into terminal state.
+		if _, ok := txn.Annotations[annotationRequestRollback]; ok {
+			log.Info("request-rollback annotation found on committed transaction")
+			r.event(txn, corev1.EventTypeWarning, "RequestRollback",
+				"user requested rollback of committed transaction")
+			delete(txn.Annotations, annotationRequestRollback)
+			if err := r.Update(ctx, txn); err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
+		}
+
+	case backupv1alpha1.TransactionPhaseFailed:
+		if r.hasUnrolledCommits(txn) {
+			rbCM := &corev1.ConfigMap{}
+			if err := r.Get(ctx, client.ObjectKey{
+				Name: txn.Status.RollbackRef, Namespace: txn.Namespace,
+			}, rbCM); err == nil {
+				log.Info("recovering failed transaction with un-rolled-back commits")
+				r.event(txn, corev1.EventTypeWarning, "RecoveryInitiated", "recovering failed transaction with un-rolled-back commits")
+				return r.transition(ctx, txn, backupv1alpha1.TransactionPhaseRollingBack)
+			}
+			log.Info("cannot recover: rollback ConfigMap missing")
+			r.event(txn, corev1.EventTypeWarning, "RecoveryBlocked", "cannot recover: rollback ConfigMap %q missing", txn.Status.RollbackRef)
+		}
+	}
+
+	// Strip lease-cleanup finalizer so subsequent deletes are instant.
+	// rollbackProtectionFinalizer is user-managed; the controller never removes it.
+	if controllerutil.RemoveFinalizer(txn, finalizerName) {
+		if err := r.Update(ctx, txn); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	return ctrl.Result{}, nil
 }
