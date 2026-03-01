@@ -1,0 +1,78 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please describe what you'd like to see.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Brief description of the feature.
+      placeholder: "Support for dry-run mode that validates a transaction without applying changes"
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this feature needed? What problem does it solve?
+      placeholder: "In CI/CD pipelines, it would be useful to validate that a transaction will succeed before actually running it."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: How should this work? Include example YAML or CLI usage if applicable.
+      placeholder: |
+        ```yaml
+        apiVersion: tx.janus.io/v1alpha1
+        kind: Transaction
+        metadata:
+          name: deploy-v2
+        spec:
+          dryRun: true
+          serviceAccountName: janus-txn
+        ```
+      render: yaml
+    validations:
+      required: false
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: What area does this feature belong to?
+      options:
+        - Controller (state machine, reconciliation)
+        - CLI (janus command)
+        - CRD API (new fields, types)
+        - Observability (metrics, events, logging)
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Other approaches or workarounds you've thought about.
+      placeholder: "Could use kubectl --dry-run=server on individual resources, but that doesn't validate the full transaction sequence."
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Links, related issues, or other relevant information.
+    validations:
+      required: false

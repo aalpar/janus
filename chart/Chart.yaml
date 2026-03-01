@@ -1,0 +1,18 @@
+apiVersion: v2
+name: janus
+description: Atomic multi-resource changes for Kubernetes (Saga pattern)
+type: application
+version: 0.0.1
+appVersion: "v0.0.1"
+home: https://github.com/aalpar/janus
+sources:
+  - https://github.com/aalpar/janus
+maintainers:
+  - name: aalpar
+    url: https://github.com/aalpar
+keywords:
+  - kubernetes
+  - operator
+  - saga
+  - transactions
+  - rollback

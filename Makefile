@@ -1,5 +1,8 @@
+# Version from VERSION file
+BUILD_VERSION ?= $(shell cat ./VERSION | tr -d '[:space:]')
+
 # Image URL to use all building/pushing image targets
-IMG ?= janus-controller:latest
+IMG ?= ghcr.io/aalpar/janus:$(BUILD_VERSION)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -99,6 +102,7 @@ clean: ## Remove all generated files and build artifacts.
 	rm -f config/rbac/role.yaml
 	rm -f config/webhook/manifests.yaml
 	chmod -R u+w $(LOCALBIN) 2>/dev/null; rm -rf $(LOCALBIN)
+	rm -rf dist/
 	rm -f cover.out
 
 .PHONY: lint
@@ -112,6 +116,64 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+##@ CI/CD
+
+.PHONY: ci
+ci: lint build test ## Full CI validation (lint, build, test).
+
+.PHONY: cd
+cd: build test ## Pre-release validation (build, test).
+
+##@ Release
+
+.PHONY: tag
+tag: ## Create annotated git tag from VERSION file.
+	git tag -a "$(BUILD_VERSION)" -m "Release $(BUILD_VERSION)"
+	@echo "Tagged $(BUILD_VERSION). Push with: git push origin $(BUILD_VERSION)"
+
+.PHONY: bump-major
+bump-major: ## Bump major version in VERSION file.
+	./tools/sh/bump-version.sh major
+
+.PHONY: bump-minor
+bump-minor: ## Bump minor version in VERSION file.
+	./tools/sh/bump-version.sh minor
+
+.PHONY: bump-patch
+bump-patch: ## Bump patch version in VERSION file.
+	./tools/sh/bump-version.sh patch
+
+.PHONY: release-check
+release-check: ## Validate .goreleaser.yml syntax.
+	goreleaser check
+
+.PHONY: release-snapshot
+release-snapshot: ## Local GoReleaser snapshot build (no publish).
+	goreleaser release --snapshot --clean
+
+.PHONY: release
+release: ## Full GoReleaser release (publishes to GitHub).
+	goreleaser release --clean
+
+##@ Helm
+
+.PHONY: helm-lint
+helm-lint: ## Lint the Helm chart.
+	helm lint chart/
+
+.PHONY: helm-template
+helm-template: ## Dry-run template rendering of the Helm chart.
+	helm template janus chart/ --namespace janus-system
+
+.PHONY: helm-package
+helm-package: ## Package the Helm chart to dist/.
+	mkdir -p dist
+	helm package chart/ --destination dist/
+
+.PHONY: helm-sync-crds
+helm-sync-crds: manifests ## Copy generated CRDs into the Helm chart.
+	cp config/crd/bases/*.yaml chart/crds/
 
 ##@ Build
 

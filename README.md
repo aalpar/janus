@@ -57,13 +57,30 @@ RBAC boundaries are enforced per transaction.
 ### Prerequisites
 - Kubernetes v1.30+
 - kubectl v1.30+
+- [cert-manager](https://cert-manager.io/docs/installation/) (for webhook TLS)
 
-### Deploy the controller
+### Helm (recommended)
 
 ```sh
-make docker-build docker-push IMG=<your-registry>/janus:tag
+helm install janus oci://ghcr.io/aalpar/janus/chart --namespace janus-system --create-namespace
+```
+
+Or from source:
+
+```sh
+helm install janus chart/ --namespace janus-system --create-namespace
+```
+
+### Container image
+
+Pre-built multi-arch images (amd64 + arm64) are published to
+`ghcr.io/aalpar/janus` on every release.
+
+### Kustomize
+
+```sh
 make install
-make deploy IMG=<your-registry>/janus:tag
+make deploy IMG=ghcr.io/aalpar/janus:v0.0.1
 ```
 
 ### Install the CLI
@@ -71,6 +88,9 @@ make deploy IMG=<your-registry>/janus:tag
 ```sh
 go install github.com/aalpar/janus/cmd/janus@latest
 ```
+
+Or download a binary from the
+[Releases](https://github.com/aalpar/janus/releases) page.
 
 ### Set up a ServiceAccount
 
@@ -123,6 +143,8 @@ partial update is worse than no update. Examples:
   monitoring, failure handling, recovery.
 - **[Design](docs/DESIGN.md)** — architecture, state machine, lock manager,
   rollback storage, reconciliation loop.
+- **[Invariants](docs/INVARIANTS.md)** — safety and liveness guarantees.
+- **[Contributing](CONTRIBUTING.md)** — how to build, test, and submit changes.
 - **[Bibliography](BIBLIOGRAPHY.md)** — annotated references on Sagas,
   two-phase commit, and crash recovery.
 

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/aalpar/janus#documentation
+    about: Check the docs before opening an issue
+  - name: Contributing Guide
+    url: https://github.com/aalpar/janus/blob/master/CONTRIBUTING.md
+    about: Learn how to contribute to Janus

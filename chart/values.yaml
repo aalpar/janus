@@ -1,0 +1,34 @@
+image:
+  repository: ghcr.io/aalpar/janus
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+replicas: 1
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+serviceAccount:
+  # name of the controller's ServiceAccount
+  name: janus-controller-manager
+
+leaderElection:
+  enabled: true
+
+metrics:
+  # expose Prometheus metrics on :8443
+  enabled: true
+
+webhook:
+  # deploy validating webhooks (requires cert-manager)
+  enabled: true
+
+certManager:
+  # install cert-manager Issuer + Certificate for webhook TLS
+  # only used when webhook.enabled is true
+  enabled: true

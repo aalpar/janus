@@ -1,0 +1,94 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the form below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of what the bug is.
+      placeholder: "Example: Transaction gets stuck in Preparing phase when a ResourceChange targets a non-existent resource"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps, YAML manifests, or CLI commands to reproduce the issue.
+      placeholder: |
+        ```bash
+        janus create test-txn --sa janus-txn
+        janus add test-txn --type Update --target ConfigMap/nonexistent -f patch.yaml
+        janus seal test-txn
+        kubectl get transaction test-txn -o yaml
+        ```
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+      placeholder: "Transaction should transition to RollingBack and then Failed"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened.
+      placeholder: "Transaction stays in Preparing indefinitely"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Janus Version
+      description: Output of `janus version` or the container image tag
+      placeholder: "v0.0.1"
+    validations:
+      required: false
+
+  - type: input
+    id: k8s-version
+    attributes:
+      label: Kubernetes Version
+      description: Output of `kubectl version --short`
+      placeholder: "v1.31.0"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options:
+        - Kind
+        - k3s/k3d
+        - EKS
+        - GKE
+        - AKS
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Controller logs, Transaction status YAML, or other relevant information.
+      placeholder: "Controller logs show: ..."
+    validations:
+      required: false
