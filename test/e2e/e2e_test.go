@@ -451,6 +451,56 @@ stringData:
 			Expect(err).To(HaveOccurred(), "forbidden-secret should not exist")
 		})
 
+		It("should roll back a committed transaction when request-rollback annotation is set", func() {
+			By("creating a prerequisite ConfigMap for the patch item")
+			applyConfigMap("reqrb-patch-target", "original: value")
+			DeferCleanup(kubectlDeleteIgnoreNotFound, "configmap", "reqrb-patch-target", testNS)
+
+			txnName := "e2e-request-rollback"
+			createTransactionWithChanges(txnName,
+				txnChange{
+					Kind: "ConfigMap", Name: "reqrb-created-cm", ChangeType: "Create",
+					Content: configMapYAML("reqrb-created-cm", `created: "yes"`),
+				},
+				txnChange{
+					Kind: "ConfigMap", Name: "reqrb-patch-target", ChangeType: "Patch",
+					Content: "data:\n  patched: \"yes\"",
+				},
+			)
+			DeferCleanup(cleanupTransaction, txnName, testNS)
+
+			waitForTransactionPhase(txnName, testNS, "Committed")
+
+			By("verifying the committed changes are in place")
+			val, err := kubectlGetField("configmap", "reqrb-created-cm", testNS, "{.data.created}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(Equal("yes"))
+
+			val, err = kubectlGetField("configmap", "reqrb-patch-target", testNS, "{.data.patched}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(Equal("yes"))
+
+			By("adding the request-rollback annotation")
+			_, err = kubectl("annotate", "transaction", txnName, "-n", testNS,
+				"tx.janus.io/request-rollback=true")
+			Expect(err).NotTo(HaveOccurred())
+
+			waitForTransactionPhase(txnName, testNS, "RolledBack")
+
+			By("verifying the created ConfigMap was deleted by rollback")
+			_, err = kubectl("get", "configmap", "reqrb-created-cm", "-n", testNS)
+			Expect(err).To(HaveOccurred(), "reqrb-created-cm should not exist after rollback")
+
+			By("verifying the patched ConfigMap was reverted")
+			val, err = kubectlGetField("configmap", "reqrb-patch-target", testNS, "{.data.original}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(Equal("value"))
+
+			val, err = kubectlGetField("configmap", "reqrb-patch-target", testNS, "{.data.patched}")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(BeEmpty(), "patched key should have been reverted")
+		})
+
 		It("should fail when referencing a non-existent ServiceAccount", func() {
 			txnName := "e2e-bad-sa"
 			createTransactionWithSA(txnName, "does-not-exist", txnChange{

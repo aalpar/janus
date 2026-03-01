@@ -640,17 +640,10 @@ func (r *TransactionReconciler) handleCommitting(ctx context.Context, txn *backu
 		return r.updateStatusAndRequeue(ctx, txn)
 	}
 
-	// All committed — release locks and clean up.
+	// All committed — release locks.
+	// Rollback ConfigMap is preserved for request-rollback; OwnerRef GC handles cleanup.
 	log.Info("all items committed, releasing locks")
 	r.releaseAllLocks(ctx, txn)
-
-	// Delete rollback ConfigMap — no longer needed.
-	rbCM := &corev1.ConfigMap{}
-	if err := r.Get(ctx, client.ObjectKey{Name: txn.Status.RollbackRef, Namespace: txn.Namespace}, rbCM); err == nil {
-		if err := r.Delete(ctx, rbCM); err != nil {
-			log.Error(err, "best-effort rollback ConfigMap cleanup failed", "configmap", txn.Status.RollbackRef)
-		}
-	}
 
 	now := metav1.Now()
 	txn.Status.CompletedAt = &now
