@@ -357,7 +357,7 @@ The phase tells you where the transaction is in its lifecycle:
 
 | Phase | Meaning |
 |---|---|
-| `Pending` | Initializing — creating rollback storage. |
+| `Pending` | Unsealed — waiting for changes to be added and the transaction to be sealed. |
 | `Preparing` | Acquiring locks and snapshotting prior state, one item at a time. |
 | `Prepared` | All items locked and snapshotted. Transitions to Committing immediately. |
 | `Committing` | Applying mutations, one item at a time. |

@@ -2,7 +2,7 @@
 
 ## Versioning
 
-- Janus is at v0.0.1 with zero consumers. Break freely — no stability guarantees until real users exist.
+- Janus is at v0.2.0 with zero consumers. Break freely — no stability guarantees until real users exist.
 - API group: `tx.janus.io/v1alpha1`
 
 ## Architecture
@@ -13,10 +13,12 @@ Two CRDs: `Transaction` and `ResourceChange` — Saga pattern with Lease-based a
 
 ```
 Pending → Preparing → Prepared → Committing → Committed
-                                      ↓
-                              RollingBack ← (failure/timeout/deletion)
-                                      ↓
-                              RolledBack | Failed
+                                      ↓              ↓
+                              RollingBack ← ──────────┘ (request-rollback)
+                              ↑     ↓
+                              └─ Failed (recovery: has unrolled commits + CM exists)
+                                    ↓
+                                RolledBack
 ```
 
 - `spec.sealed` triggers processing (Pending → Preparing)

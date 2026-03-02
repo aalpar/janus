@@ -62,11 +62,11 @@ Pending → Preparing → Prepared → Committing → Committed
                                     Failed
 ```
 
-No backward transitions, with one exception: **Failed → RollingBack** when:
-1. The transaction has unrolled commits (`hasUnrolledCommits` is true), AND
-2. The rollback ConfigMap still exists.
+No backward transitions, with two exceptions:
 
-This recovery re-entry happens automatically on every reconcile of a Failed transaction that meets both conditions. If rollback keeps failing for the same reason, this creates a retry loop bounded only by the transaction timeout.
+1. **Failed → RollingBack** when the transaction has unrolled commits (`hasUnrolledCommits` is true) AND the rollback ConfigMap still exists. This recovery re-entry happens automatically on every reconcile of a Failed transaction that meets both conditions.
+
+2. **Committed → RollingBack** when the `request-rollback` annotation is added to a Committed transaction. The controller consumes the annotation and transitions to RollingBack. This is a one-shot user-initiated action.
 
 ### S6. One item per reconcile cycle
 
@@ -113,9 +113,9 @@ All leases acquired by a transaction are eventually released — either explicit
 
 ### L3. Rollback ConfigMap is eventually cleaned up
 
-The rollback ConfigMap is deleted when the transaction reaches Committed.
+The rollback ConfigMap is preserved when the transaction reaches Committed (available for `request-rollback`) and cleaned up via OwnerReference when the Transaction is deleted.
 
-**Enforcement:** Best-effort delete in `handleCommitting` after all items committed. Errors are logged and swallowed. The OwnerReference ensures garbage collection when the Transaction is deleted.
+**Enforcement:** The ConfigMap is OwnerRef'd to the Transaction, so Kubernetes garbage-collects it when the Transaction is deleted. No explicit deletion on commit.
 
 ---
 

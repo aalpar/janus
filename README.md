@@ -80,7 +80,7 @@ Pre-built multi-arch images (amd64 + arm64) are published to
 
 ```sh
 make install
-make deploy IMG=ghcr.io/aalpar/janus:v0.0.1
+make deploy IMG=ghcr.io/aalpar/janus:v0.2.0
 ```
 
 ### Install the CLI

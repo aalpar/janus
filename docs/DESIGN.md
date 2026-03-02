@@ -117,6 +117,8 @@ stateDiagram-v2
 
     Failed --> RollingBack : recovery (has un-rolled commits + CM exists)
 
+    Committed --> RollingBack : request-rollback annotation
+
     Committed --> [*]
     RolledBack --> [*]
 ```
@@ -166,7 +168,7 @@ reconcile()
   │    apply mutation
   │    ├─ success: mark item committed, requeue
   │    └─ failure: phase → RollingBack, requeue
-  │    (if all done: release locks, delete rollback CM, phase → Committed)
+  │    (if all done: release locks, phase → Committed; rollback CM preserved)
   │
   ├─ phase == RollingBack
   │    iterate items in reverse
@@ -188,7 +190,7 @@ reconcile()
 
 ## Lock manager
 
-Locks are Kubernetes Lease objects in the Transaction's namespace, named
+Locks are Kubernetes Lease objects in the **target resource's** namespace, named
 deterministically: `janus-lock-{namespace}-{kind}-{name}` (lowercased).
 
 ```
@@ -236,8 +238,9 @@ During rollback, stored objects are cleaned of server-set metadata
 preserved — they were part of the original resource state and are needed to
 maintain GC chains and external controller contracts.
 
-The ConfigMap is deleted on successful commit (no longer needed) and preserved
-on rollback or failure (available for debugging).
+The ConfigMap is preserved on successful commit (available for `request-rollback`)
+and on rollback or failure (available for recovery). It is garbage-collected via
+OwnerReference when the Transaction is deleted.
 
 ## ServiceAccount impersonation
 
@@ -262,15 +265,17 @@ are held, the controller gets a chance to release them. The finalizer is
 stripped once the Transaction reaches a terminal phase (Committed, RolledBack,
 or Failed) so that subsequent deletes are instant.
 
-Deleting a Transaction during an active phase (Preparing, Committing)
-releases leases but does **not** roll back partially committed changes.
-Rollback is a business decision — use the RollingBack phase for explicit
-compensation.
+Deleting a Transaction during an active phase (Preparing, Committing) triggers
+rollback of any committed changes if the `automatic-rollback` annotation is
+present (it is by default). If the annotation has been removed, the
+`rollback-protection` finalizer blocks deletion until the user manually
+removes it — preventing silent data loss.
 
 ## Annotations & finalizers
 
 - `tx.janus.io/automatic-rollback` — present by default; remove to skip rollback on Transaction deletion
-- `tx.janus.io/retry-rollback` — one-shot trigger; controller removes after attempt
+- `tx.janus.io/retry-rollback` — one-shot trigger for Failed transactions; controller removes after attempt
+- `tx.janus.io/request-rollback` — one-shot trigger for Committed transactions; controller removes and transitions to RollingBack
 - `tx.janus.io/lease-cleanup` — controller-managed finalizer; stripped in terminal states
 - `tx.janus.io/rollback-protection` — controller adds, never removes; user strips to allow deletion
 

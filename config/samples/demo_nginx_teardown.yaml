@@ -1,14 +1,16 @@
 # Demo teardown: removes all objects created by demo_nginx_setup.yaml
 # and demo_nginx_txn.sh.
 #
+# This does NOT delete Transactions — they have a rollback-protection
+# finalizer that must be removed first. Strip finalizers and delete
+# transactions separately:
+#
+#   kubectl patch transaction nginx-patch --type=merge \
+#     -p '{"metadata":{"finalizers":null}}' 2>/dev/null
+#   kubectl delete transaction nginx-patch --ignore-not-found
+#
 # Usage:
 #   kubectl delete -f demo_nginx_teardown.yaml --ignore-not-found
----
-apiVersion: tx.janus.io/v1alpha1
-kind: Transaction
-metadata:
-  name: nginx-patch
-  namespace: default
 ---
 apiVersion: v1
 kind: Service
