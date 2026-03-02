@@ -41,11 +41,20 @@ Committed transaction
   └─ no → strip lease-cleanup finalizer, return (existing behavior)
 ```
 
+### Rollback ConfigMap preservation
+
+Previously, `handleCommitting` eagerly deleted the rollback ConfigMap after
+all items committed. This is incompatible with request-rollback — the
+rollback data must survive past commit. The eager deletion was removed;
+the ConfigMap's OwnerReference to the Transaction handles cleanup via
+Kubernetes garbage collection when the Transaction is deleted.
+
 ### Edge cases
 
 **Rollback ConfigMap missing.** `handleRollingBack` already checks for this
-and marks the transaction Failed with a descriptive message. No special
-handling needed.
+and marks the transaction Failed with a descriptive message. This can occur
+if the Transaction was committed before the preservation fix, or if the
+ConfigMap was manually deleted.
 
 **Locks already released.** Committed transactions have released all locks.
 Rollback does not re-acquire them. Safety comes from RV conflict detection
@@ -64,8 +73,9 @@ in the Committed branch of the reconcile loop.
 | File | Change |
 |------|--------|
 | `api/v1alpha1/transaction_types.go` | Add `AnnotationRequestRollback` constant |
-| `internal/controller/transaction_controller.go` | ~10 lines: check annotation in Committed case, consume it, transition to RollingBack |
-| `internal/controller/transaction_controller_test.go` | Test: Committed + annotation → RollingBack; annotation consumed |
+| `internal/controller/transaction_controller.go` | Extract `handleTerminal`; check annotation in Committed case; remove eager rollback CM deletion |
+| `internal/controller/transaction_controller_test.go` | Unit test: Committed + annotation → RollingBack; annotation consumed |
+| `test/e2e/e2e_test.go` | E2e test: full round-trip Create+Patch → Committed → annotate → RolledBack |
 | `docs/TUTORIAL.md` | Add kubectl rollback example to Part 5 |
 | `docs/USER_GUIDE.md` | Document the annotation |
 | `CLAUDE.md` | Add annotation to the Annotations & Finalizers table |
