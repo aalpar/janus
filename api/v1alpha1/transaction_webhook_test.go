@@ -115,6 +115,14 @@ func TestValidateUpdate_AllowStatusOnlyChange(t *testing.T) {
 	}
 }
 
+func TestValidateDelete_AlwaysAllowed(t *testing.T) {
+	v := &TransactionCustomValidator{}
+	_, err := v.ValidateDelete(context.Background(), validTxn())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
 // --- ResourceChange webhook tests ---
 
 func validResourceChange() *ResourceChange {
@@ -168,6 +176,22 @@ func TestResourceChange_DeleteWithoutContent(t *testing.T) {
 	_, err := v.ValidateCreate(context.Background(), rc)
 	if err != nil {
 		t.Fatalf("expected no error for Delete without content, got %v", err)
+	}
+}
+
+func TestResourceChange_UpdateAlwaysAllowed(t *testing.T) {
+	v := &ResourceChangeCustomValidator{}
+	_, err := v.ValidateUpdate(context.Background(), validResourceChange(), validResourceChange())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestResourceChange_DeleteAlwaysAllowed(t *testing.T) {
+	v := &ResourceChangeCustomValidator{}
+	_, err := v.ValidateDelete(context.Background(), validResourceChange())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 }
 
