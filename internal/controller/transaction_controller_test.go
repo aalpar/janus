@@ -4859,4 +4859,144 @@ var _ = Describe("direct method tests", func() {
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 		})
 	})
+
+	Context("applyRollback", func() {
+		It("Create rollback returns nil when target already deleted", func() {
+			// Rollback envelope with nil PriorState = fresh create; reverse = delete.
+			// Target doesn't exist → idempotent nil.
+			rbKey := rollback.Key("ConfigMap", testNamespace, "ar-create-gone-cm")
+			envJSON, err := json.Marshal(rollback.Envelope{
+				ChangeType:      "Create",
+				ResourceVersion: "999",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			rbCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ar-create-gone-rbcm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{rbKey: string(envJSON)},
+			}
+			Expect(k8sClient.Create(ctx, rbCM)).To(Succeed())
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ar-create-gone-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeCreate,
+			}
+			err = reconciler.applyRollback(ctx, k8sClient, change, testNamespace, rbCM, "dummy-txn")
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Delete(ctx, rbCM)).To(Succeed())
+		})
+
+		It("Create rollback returns RollbackDataError on corrupt CM data", func() {
+			rbKey := rollback.Key("ConfigMap", testNamespace, "ar-create-corrupt-cm")
+			rbCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ar-create-corrupt-rbcm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{rbKey: "not-json{{{"},
+			}
+			Expect(k8sClient.Create(ctx, rbCM)).To(Succeed())
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ar-create-corrupt-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeCreate,
+			}
+			err := reconciler.applyRollback(ctx, k8sClient, change, testNamespace, rbCM, "dummy-txn")
+
+			var rbErr *RollbackDataError
+			Expect(errors.As(err, &rbErr)).To(BeTrue(), "expected RollbackDataError, got: %v", err)
+
+			Expect(k8sClient.Delete(ctx, rbCM)).To(Succeed())
+		})
+
+		It("Delete rollback returns RollbackDataError on corrupt CM data", func() {
+			rbKey := rollback.Key("ConfigMap", testNamespace, "ar-delete-corrupt-cm")
+			rbCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ar-delete-corrupt-rbcm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{rbKey: "not-json{{{"},
+			}
+			Expect(k8sClient.Create(ctx, rbCM)).To(Succeed())
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ar-delete-corrupt-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}
+			err := reconciler.applyRollback(ctx, k8sClient, change, testNamespace, rbCM, "dummy-txn")
+
+			var rbErr *RollbackDataError
+			Expect(errors.As(err, &rbErr)).To(BeTrue(), "expected RollbackDataError, got: %v", err)
+
+			Expect(k8sClient.Delete(ctx, rbCM)).To(Succeed())
+		})
+
+		It("Update rollback returns RollbackDataError on corrupt CM data", func() {
+			rbKey := rollback.Key("ConfigMap", testNamespace, "ar-update-corrupt-cm")
+			rbCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ar-update-corrupt-rbcm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{rbKey: "not-json{{{"},
+			}
+			Expect(k8sClient.Create(ctx, rbCM)).To(Succeed())
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ar-update-corrupt-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeUpdate,
+			}
+			err := reconciler.applyRollback(ctx, k8sClient, change, testNamespace, rbCM, "dummy-txn")
+
+			var rbErr *RollbackDataError
+			Expect(errors.As(err, &rbErr)).To(BeTrue(), "expected RollbackDataError, got: %v", err)
+
+			Expect(k8sClient.Delete(ctx, rbCM)).To(Succeed())
+		})
+
+		It("unknown change type returns errUnknownChangeType", func() {
+			rbCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ar-unknown-rbcm",
+					Namespace: testNamespace,
+				},
+			}
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "irrelevant",
+				},
+				Type: backupv1alpha1.ChangeType("Bogus"),
+			}
+			err := reconciler.applyRollback(ctx, k8sClient, change, testNamespace, rbCM, "dummy-txn")
+			Expect(errors.Is(err, errUnknownChangeType)).To(BeTrue(), "expected errUnknownChangeType, got: %v", err)
+		})
+	})
 })
