@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -5055,6 +5056,214 @@ var _ = Describe("direct method tests", func() {
 			}
 			err := reconciler.applyRollback(ctx, k8sClient, change, testNamespace, rbCM, "dummy-txn")
 			Expect(errors.Is(err, errUnknownChangeType)).To(BeTrue(), "expected errUnknownChangeType, got: %v", err)
+		})
+	})
+
+	Context("error types", func() {
+		It("ResourceOpError.Error with Ref", func() {
+			e := &ResourceOpError{Op: "fetching", Ref: "ConfigMap/my-cm", Err: errors.New("not found")}
+			Expect(e.Error()).To(Equal("fetching ConfigMap/my-cm: not found"))
+		})
+
+		It("ResourceOpError.Error without Ref", func() {
+			e := &ResourceOpError{Op: "fetching", Err: errors.New("not found")}
+			Expect(e.Error()).To(Equal("fetching: not found"))
+		})
+
+		It("ResourceOpError.Unwrap returns inner error", func() {
+			inner := errors.New("inner")
+			e := &ResourceOpError{Op: "op", Err: inner}
+			Expect(e.Unwrap()).To(Equal(inner))
+		})
+
+		It("RollbackDataError.Error with nil Err", func() {
+			e := &RollbackDataError{Key: "ConfigMap_default_my-cm"}
+			Expect(e.Error()).To(Equal("no rollback data for ConfigMap_default_my-cm"))
+		})
+	})
+
+	Context("findItemStatus", func() {
+		It("returns nil when name not found", func() {
+			items := []backupv1alpha1.ItemStatus{
+				{Name: "a"},
+				{Name: "b"},
+			}
+			Expect(findItemStatus(items, "c")).To(BeNil())
+		})
+	})
+
+	Context("unmarshalContent", func() {
+		It("returns ResourceOpError on bad JSON", func() {
+			ref := backupv1alpha1.ResourceRef{Kind: "ConfigMap", Name: "bad"}
+			_, err := reconciler.unmarshalContent(runtime.RawExtension{Raw: []byte("not-json{{{")}, ref)
+			var opErr *ResourceOpError
+			Expect(errors.As(err, &opErr)).To(BeTrue(), "expected ResourceOpError, got: %v", err)
+			Expect(opErr.Op).To(Equal("unmarshaling content"))
+			Expect(opErr.Ref).To(Equal("ConfigMap/bad"))
+		})
+	})
+
+	Context("event", func() {
+		It("records event when Recorder is set", func() {
+			fakeRec := record.NewFakeRecorder(10)
+			r := &TransactionReconciler{Recorder: fakeRec}
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{Name: "ev-txn", Namespace: testNamespace},
+			}
+			r.event(txn, corev1.EventTypeNormal, "TestReason", "hello %s", "world")
+
+			var got string
+			Eventually(fakeRec.Events).Should(Receive(&got))
+			Expect(got).To(ContainSubstring("TestReason"))
+			Expect(got).To(ContainSubstring("hello world"))
+		})
+	})
+
+	Context("releaseAllLocks", func() {
+		It("logs error when ReleaseAll fails", func() {
+			r := &TransactionReconciler{
+				Client:  k8sClient,
+				Scheme:  k8sClient.Scheme(),
+				BaseCfg: cfg,
+				Mapper:  testMapper,
+				LockMgr: &fakeLockMgr{
+					releaseAllFn: func(_ context.Context, _ []lock.LeaseRef, _ string) error {
+						return errors.New("injected release error")
+					},
+				},
+			}
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{Name: "ral-err-txn", Namespace: testNamespace},
+				Status: backupv1alpha1.TransactionStatus{
+					Items: []backupv1alpha1.ItemStatus{
+						{Name: "item1", LockLease: "lease-1", LeaseNamespace: testNamespace},
+					},
+				},
+			}
+			// Should not panic; logs the error and records error metric.
+			r.releaseAllLocks(ctx, txn)
+		})
+	})
+
+	Context("applyChange additional branches", func() {
+		It("unknown change type returns errUnknownChangeType", func() {
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "irrelevant",
+				},
+				Type: backupv1alpha1.ChangeType("Bogus"),
+			}
+			err := reconciler.applyChange(ctx, k8sClient, change, testNamespace, "dummy-txn", "")
+			Expect(errors.Is(err, errUnknownChangeType)).To(BeTrue(), "expected errUnknownChangeType, got: %v", err)
+		})
+
+		It("Create with bad JSON returns ResourceOpError", func() {
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "bad-create",
+				},
+				Type:    backupv1alpha1.ChangeTypeCreate,
+				Content: runtime.RawExtension{Raw: []byte("not-json{{{")},
+			}
+			err := reconciler.applyChange(ctx, k8sClient, change, testNamespace, "dummy-txn", "")
+			var opErr *ResourceOpError
+			Expect(errors.As(err, &opErr)).To(BeTrue(), "expected ResourceOpError, got: %v", err)
+			Expect(opErr.Op).To(Equal("unmarshaling content"))
+		})
+
+		It("Update with bad JSON returns ResourceOpError", func() {
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "bad-update",
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: []byte("not-json{{{")},
+			}
+			err := reconciler.applyChange(ctx, k8sClient, change, testNamespace, "dummy-txn", "1")
+			var opErr *ResourceOpError
+			Expect(errors.As(err, &opErr)).To(BeTrue(), "expected ResourceOpError, got: %v", err)
+			Expect(opErr.Op).To(Equal("unmarshaling content"))
+		})
+	})
+
+	Context("updateRollbackRV", func() {
+		It("returns nil when rbKey is missing from ConfigMap", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "urv-nokey-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"other_key": "{}"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			// Create a real target so getResource succeeds.
+			target := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "urv-target",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"k": "v"},
+			}
+			Expect(k8sClient.Create(ctx, target)).To(Succeed())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{Name: "urv-nokey-txn", Namespace: testNamespace},
+				Status: backupv1alpha1.TransactionStatus{
+					RollbackRef: "urv-nokey-cm",
+				},
+			}
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "urv-target",
+					Namespace:  testNamespace,
+				},
+			}
+			err := reconciler.updateRollbackRV(ctx, txn, change, testNamespace, k8sClient)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, target)).To(Succeed())
+		})
+
+		It("returns error when rollback ConfigMap does not exist", func() {
+			// Create a real target so getResource succeeds.
+			target := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "urv-nocm-target",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"k": "v"},
+			}
+			Expect(k8sClient.Create(ctx, target)).To(Succeed())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{Name: "urv-nocm-txn", Namespace: testNamespace},
+				Status: backupv1alpha1.TransactionStatus{
+					RollbackRef: "nonexistent-rb-cm",
+				},
+			}
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "urv-nocm-target",
+					Namespace:  testNamespace,
+				},
+			}
+			err := reconciler.updateRollbackRV(ctx, txn, change, testNamespace, k8sClient)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected NotFound, got: %v", err)
+
+			Expect(k8sClient.Delete(ctx, target)).To(Succeed())
 		})
 	})
 })

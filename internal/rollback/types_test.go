@@ -140,7 +140,7 @@ func TestCleanForRestore(t *testing.T) {
 				"namespace":         "original-ns",
 				"resourceVersion":   "999",
 				"uid":               "abc-123",
-				"creationTimestamp":  "2024-01-01T00:00:00Z",
+				"creationTimestamp": "2024-01-01T00:00:00Z",
 				"generation":        int64(3),
 				"managedFields":     []interface{}{map[string]interface{}{"manager": "kubectl"}},
 			},
