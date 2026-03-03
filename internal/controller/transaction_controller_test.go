@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -4643,5 +4644,219 @@ var _ = Describe("computeReversePatch", func() {
 		}
 		result := computeReversePatch(forwardPatch, priorState)
 		Expect(result).To(BeEmpty())
+	})
+})
+
+// --- direct method tests ---
+// These test safety-net branches in applyChange and readCommittedRV that only
+// fire during races between checkConflict and the actual apply. They cannot be
+// reached through Reconcile() without simulating a mid-cycle state change.
+
+var _ = Describe("direct method tests", func() {
+	var reconciler *TransactionReconciler
+
+	BeforeEach(func() {
+		reconciler = &TransactionReconciler{
+			Client:  k8sClient,
+			Scheme:  k8sClient.Scheme(),
+			BaseCfg: cfg,
+			Mapper:  testMapper,
+			LockMgr: &lock.LeaseManager{Client: k8sClient},
+		}
+	})
+
+	Context("applyChange", func() {
+		It("Delete returns nil when resource is already gone", func() {
+			// Create and immediately delete a ConfigMap so it doesn't exist.
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ac-del-gone-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"k": "v"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ac-del-gone-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}
+			err := reconciler.applyChange(ctx, k8sClient, change, testNamespace, "dummy-txn", "1")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("Update with stale RV returns ErrConflictDetected", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ac-upd-stale-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"k": "v"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+			staleRV := cm.ResourceVersion
+
+			// Bump the RV by updating externally.
+			cm.Data["k"] = "v2"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+			Expect(cm.ResourceVersion).NotTo(Equal(staleRV))
+
+			updateContent, err := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "ac-upd-stale-cm", "namespace": testNamespace},
+				"data":       map[string]any{"k": "v3"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ac-upd-stale-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypeUpdate,
+				Content: runtime.RawExtension{Raw: updateContent},
+			}
+			err = reconciler.applyChange(ctx, k8sClient, change, testNamespace, "dummy-txn", staleRV)
+
+			var conflict *ErrConflictDetected
+			Expect(errors.As(err, &conflict)).To(BeTrue(), "expected ErrConflictDetected, got: %v", err)
+			Expect(conflict.Ref).To(Equal(change.Target))
+			Expect(conflict.Expected).To(Equal(staleRV))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("Delete with stale RV precondition returns ErrConflictDetected", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ac-del-stale-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"k": "v"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+			staleRV := cm.ResourceVersion
+
+			// Bump the RV by updating externally.
+			cm.Data["k"] = "v2"
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+			Expect(cm.ResourceVersion).NotTo(Equal(staleRV))
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ac-del-stale-cm",
+					Namespace:  testNamespace,
+				},
+				Type: backupv1alpha1.ChangeTypeDelete,
+			}
+			err := reconciler.applyChange(ctx, k8sClient, change, testNamespace, "dummy-txn", staleRV)
+
+			var conflict *ErrConflictDetected
+			Expect(errors.As(err, &conflict)).To(BeTrue(), "expected ErrConflictDetected, got: %v", err)
+			Expect(conflict.Expected).To(Equal(staleRV))
+
+			// Clean up.
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
+	Context("readCommittedRV", func() {
+		It("returns empty string when rollback ConfigMap does not exist", func() {
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rcrv-missing-cm-txn",
+					Namespace: testNamespace,
+				},
+				Status: backupv1alpha1.TransactionStatus{
+					RollbackRef: "nonexistent-rollback-cm",
+				},
+			}
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "some-target",
+				},
+			}
+			rv := reconciler.readCommittedRV(ctx, txn, change, testNamespace)
+			Expect(rv).To(BeEmpty())
+		})
+
+		It("returns empty string when rollback ConfigMap is missing the key", func() {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rcrv-nokey-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"other_key": "{}"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rcrv-nokey-txn",
+					Namespace: testNamespace,
+				},
+				Status: backupv1alpha1.TransactionStatus{
+					RollbackRef: "rcrv-nokey-cm",
+				},
+			}
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "some-target",
+				},
+			}
+			rv := reconciler.readCommittedRV(ctx, txn, change, testNamespace)
+			Expect(rv).To(BeEmpty())
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+
+		It("returns empty string when rollback data is corrupt JSON", func() {
+			rbKey := rollback.Key("ConfigMap", testNamespace, "corrupt-target")
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rcrv-corrupt-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{rbKey: "not-valid-json{{{"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			txn := &backupv1alpha1.Transaction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rcrv-corrupt-txn",
+					Namespace: testNamespace,
+				},
+				Status: backupv1alpha1.TransactionStatus{
+					RollbackRef: "rcrv-corrupt-cm",
+				},
+			}
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "corrupt-target",
+				},
+			}
+			rv := reconciler.readCommittedRV(ctx, txn, change, testNamespace)
+			Expect(rv).To(BeEmpty())
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
 	})
 })
