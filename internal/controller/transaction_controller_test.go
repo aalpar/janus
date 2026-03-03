@@ -4979,6 +4979,64 @@ var _ = Describe("direct method tests", func() {
 			Expect(k8sClient.Delete(ctx, rbCM)).To(Succeed())
 		})
 
+		It("Patch rollback returns ResourceOpError when forward content is corrupt", func() {
+			// Valid rollback envelope (loadRollbackState succeeds), but the
+			// forward patch content in the change spec is bad JSON.
+			rbKey := rollback.Key("ConfigMap", testNamespace, "ar-patch-badcontent-cm")
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ar-patch-badcontent-cm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{"k": "v"},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			priorJSON, err := json.Marshal(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "ar-patch-badcontent-cm", "namespace": testNamespace},
+				"data":       map[string]any{"k": "v"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			envJSON, err := json.Marshal(rollback.Envelope{
+				ChangeType:      "Patch",
+				ResourceVersion: cm.ResourceVersion,
+				PriorState:      priorJSON,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			rbCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ar-patch-badcontent-rbcm",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{rbKey: string(envJSON)},
+			}
+			Expect(k8sClient.Create(ctx, rbCM)).To(Succeed())
+
+			change := backupv1alpha1.ResourceChangeSpec{
+				Target: backupv1alpha1.ResourceRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Name:       "ar-patch-badcontent-cm",
+					Namespace:  testNamespace,
+				},
+				Type:    backupv1alpha1.ChangeTypePatch,
+				Content: runtime.RawExtension{Raw: []byte("not-json{{{")},
+			}
+			err = reconciler.applyRollback(ctx, k8sClient, change, testNamespace, rbCM, "dummy-txn")
+
+			var opErr *ResourceOpError
+			Expect(errors.As(err, &opErr)).To(BeTrue(), "expected ResourceOpError, got: %v", err)
+			Expect(opErr.Op).To(Equal("unmarshaling patch content for reverse"))
+
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, rbCM)).To(Succeed())
+		})
+
 		It("unknown change type returns errUnknownChangeType", func() {
 			rbCM := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
