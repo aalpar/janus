@@ -3,6 +3,9 @@ package rollback
 import (
 	"encoding/json"
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestEnvelopeMarshalRoundTrip(t *testing.T) {
@@ -124,6 +127,75 @@ func TestMetaMarshalRoundTrip(t *testing.T) {
 		if gotC.RollbackKey != wantC.RollbackKey {
 			t.Errorf("Changes[%d].RollbackKey = %q, want %q", i, gotC.RollbackKey, wantC.RollbackKey)
 		}
+	}
+}
+
+func TestCleanForRestore(t *testing.T) {
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata": map[string]interface{}{
+				"name":              "my-cm",
+				"namespace":         "original-ns",
+				"resourceVersion":   "999",
+				"uid":               "abc-123",
+				"creationTimestamp":  "2024-01-01T00:00:00Z",
+				"generation":        int64(3),
+				"managedFields":     []interface{}{map[string]interface{}{"manager": "kubectl"}},
+			},
+			"status": map[string]interface{}{"phase": "Active"},
+			"data":   map[string]interface{}{"key": "value"},
+		},
+	}
+
+	CleanForRestore(obj, "target-ns")
+
+	if rv := obj.GetResourceVersion(); rv != "" {
+		t.Errorf("ResourceVersion = %q, want empty", rv)
+	}
+	if uid := string(obj.GetUID()); uid != "" {
+		t.Errorf("UID = %q, want empty", uid)
+	}
+	if ct := obj.GetCreationTimestamp(); ct != (metav1.Time{}) {
+		t.Errorf("CreationTimestamp = %v, want zero", ct)
+	}
+	if gen := obj.GetGeneration(); gen != 0 {
+		t.Errorf("Generation = %d, want 0", gen)
+	}
+	if mf := obj.GetManagedFields(); mf != nil {
+		t.Errorf("ManagedFields = %v, want nil", mf)
+	}
+	if _, ok := obj.Object["status"]; ok {
+		t.Error("status field still present, want deleted")
+	}
+	if ns := obj.GetNamespace(); ns != "target-ns" {
+		t.Errorf("Namespace = %q, want %q", ns, "target-ns")
+	}
+	// Verify data is preserved.
+	data, _, _ := unstructured.NestedString(obj.Object, "data", "key")
+	if data != "value" {
+		t.Errorf("data.key = %q, want %q", data, "value")
+	}
+}
+
+func TestCleanForRestoreEmptyTargetNS(t *testing.T) {
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata": map[string]interface{}{
+				"name":            "my-cm",
+				"namespace":       "original-ns",
+				"resourceVersion": "1",
+			},
+		},
+	}
+
+	CleanForRestore(obj, "")
+
+	if ns := obj.GetNamespace(); ns != "original-ns" {
+		t.Errorf("Namespace = %q, want %q (preserved when targetNS empty)", ns, "original-ns")
 	}
 }
 
