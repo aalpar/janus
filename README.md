@@ -1,34 +1,46 @@
 # Janus
 
-Atomic multi-resource changes for Kubernetes.
+Field-level atomic changes across Kubernetes resources.
 
-Apply a group of resources together. If any step fails, everything that
-was committed rolls back.
+Janus extends Server-Side Apply's field ownership concept across resource
+boundaries. Where SSA lets a field manager own fields within a single
+resource, Janus lets a transaction own fields across multiple resources
+in multiple namespaces — and move them together. If any step fails,
+everything rolls back.
+
+Janus composes with existing GitOps tools. ArgoCD owns the Deployment.
+Flux owns the HelmRelease. Janus patches specific fields across both as
+part of an operational change. No conflict — SSA field managers partition
+ownership.
 
 ## Example
 
 ```sh
 # Create a transaction
-janus create deploy-v2 --sa janus-txn
+janus create db-migration --sa janus-ops
 
-# Add changes (ordered by --order, default 0)
-janus add deploy-v2 --type Patch --target ConfigMap/app-config -f config-patch.yaml
-janus add deploy-v2 --type Patch --target Deployment/web-server -f deploy-patch.yaml --order 1
-janus add deploy-v2 --type Delete --target Secret/old-api-key --order 2
+# Patch connection strings across namespaces
+janus add db-migration --type Patch --target ConfigMap/app-config -n frontend \
+  -f connection-patch.yaml
+janus add db-migration --type Patch --target ConfigMap/app-config -n backend \
+  -f connection-patch.yaml --order 1
+janus add db-migration --type Patch --target Deployment/api-server -n backend \
+  -f env-patch.yaml --order 2
 
 # Seal to begin processing
-janus seal deploy-v2
+janus seal db-migration
 ```
 
-If the Deployment patch fails, the ConfigMap patch is automatically
-reverted. If the Secret delete fails, both prior changes are reverted.
+If the Deployment patch fails, both ConfigMap patches are automatically
+reverted. Each resource's prior field values are captured before mutation
+and restored on rollback.
 
 ```sh
-kubectl get transaction deploy-v2
+kubectl get transaction db-migration
 ```
 ```
-NAME        SEALED   PHASE       AGE
-deploy-v2   true     Committed   34s
+NAME            SEALED   PHASE       AGE
+db-migration    true     Committed   34s
 ```
 
 ## How it works
@@ -44,6 +56,11 @@ Two CRDs:
 - **ResourceChange** — a single mutation (Create, Update, Patch, or Delete)
   owned by a Transaction.
 
+Patch operations use Server-Side Apply with a field manager scoped to the
+transaction. This means Janus owns only the fields it touches — other
+controllers and GitOps tools retain ownership of their fields on the same
+resources.
+
 Resources are locked via advisory Kubernetes Leases during the
 transaction. Locks prevent concurrent Janus transactions from colliding
 but do not block direct `kubectl` writes — this is a deliberate trade-off
@@ -51,6 +68,32 @@ to avoid admission webhook overhead.
 
 Operations execute under a user-specified ServiceAccount identity, so
 RBAC boundaries are enforced per transaction.
+
+## When to use this
+
+Operational changes that span multiple resources or namespaces, where
+the intermediate state is dangerous and GitOps doesn't apply:
+
+- **Cross-resource field patches** — update connection strings in 3
+  ConfigMaps and an env var in 2 Deployments as one unit; rollback
+  all if any fails
+- **Cross-namespace coordination** — tenant provisioning, service mesh
+  config, or infrastructure changes that cross namespace boundaries
+- **Operational changes outside GitOps** — incident response, migrations,
+  or infrastructure changes that aren't templated manifests in a repo
+- **Security-sensitive intermediate states** — Namespace + RBAC +
+  NetworkPolicy where a partial apply creates an unprotected window
+
+## When not to use this
+
+- **Single-resource changes** — just use `kubectl apply`.
+- **Standard deployments** — if your changes are templated manifests in
+  git, use Helm, ArgoCD, or Flux. Janus is for operational changes
+  that live outside the GitOps lifecycle.
+- **Workflow orchestration** — Janus applies resource mutations, not
+  arbitrary jobs. Use Argo Workflows or Tekton for DAGs.
+- **Workloads where eventual consistency is acceptable** — standard
+  Kubernetes reconciliation is simpler and more idiomatic.
 
 ## Install
 
@@ -101,13 +144,13 @@ one with permissions on the resources your transactions will touch:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: janus-txn
+  name: janus-ops
   namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: janus-txn-edit
+  name: janus-ops-edit
   namespace: default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -115,27 +158,9 @@ roleRef:
   name: edit
 subjects:
 - kind: ServiceAccount
-  name: janus-txn
+  name: janus-ops
   namespace: default
 ```
-
-## When to use this
-
-You have multiple Kubernetes resources that must change together, and a
-partial update is worse than no update. Examples:
-
-- ConfigMap + Deployment + Secret as a single deploy step
-- Namespace + RBAC + NetworkPolicy where the intermediate state is a
-  security gap
-- Any coordinated create/update/delete where you want automatic rollback
-
-## When not to use this
-
-- Single-resource changes — just use `kubectl apply`.
-- Workloads where eventual consistency is acceptable — standard
-  Kubernetes reconciliation is simpler and more idiomatic.
-- Workflow orchestration — Janus applies resource mutations, not
-  arbitrary jobs. Use Argo Workflows or Tekton for DAGs.
 
 ## Documentation
 
