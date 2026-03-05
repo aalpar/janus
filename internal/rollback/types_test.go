@@ -132,20 +132,20 @@ func TestMetaMarshalRoundTrip(t *testing.T) {
 
 func TestCleanForRestore(t *testing.T) {
 	obj := &unstructured.Unstructured{
-		Object: map[string]interface{}{
+		Object: map[string]any{
 			"apiVersion": "v1",
 			"kind":       "ConfigMap",
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"name":              "my-cm",
 				"namespace":         "original-ns",
 				"resourceVersion":   "999",
 				"uid":               "abc-123",
 				"creationTimestamp": "2024-01-01T00:00:00Z",
 				"generation":        int64(3),
-				"managedFields":     []interface{}{map[string]interface{}{"manager": "kubectl"}},
+				"managedFields":     []any{map[string]any{"manager": "kubectl"}},
 			},
-			"status": map[string]interface{}{"phase": "Active"},
-			"data":   map[string]interface{}{"key": "value"},
+			"status": map[string]any{"phase": "Active"},
+			"data":   map[string]any{"key": "value"},
 		},
 	}
 
@@ -181,10 +181,10 @@ func TestCleanForRestore(t *testing.T) {
 
 func TestCleanForRestoreEmptyTargetNS(t *testing.T) {
 	obj := &unstructured.Unstructured{
-		Object: map[string]interface{}{
+		Object: map[string]any{
 			"apiVersion": "v1",
 			"kind":       "ConfigMap",
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"name":            "my-cm",
 				"namespace":       "original-ns",
 				"resourceVersion": "1",
