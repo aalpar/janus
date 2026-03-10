@@ -1,17 +1,15 @@
 # Janus
 
-Field-level atomic changes across Kubernetes resources.
+Atomic changes across Kubernetes resources.
 
-Janus extends Server-Side Apply's field ownership concept across resource
-boundaries. Where SSA lets a field manager own fields within a single
-resource, Janus lets a transaction own fields across multiple resources
-in multiple namespaces — and move them together. If any step fails,
+Janus groups resource mutations across multiple Kubernetes namespaces
+into a single transaction. Create, Update, Patch, or Delete — each step
+is paired with an automatic compensating action. If any step fails,
 everything rolls back.
 
-Janus composes with existing GitOps tools. ArgoCD owns the Deployment.
-Flux owns the HelmRelease. Janus patches specific fields across both as
-part of an operational change. No conflict — SSA field managers partition
-ownership.
+Patch operations use Server-Side Apply, so Janus owns only the fields it
+touches. This composes cleanly with GitOps tools — ArgoCD and Flux keep
+ownership of their fields on the same resources.
 
 ## Example
 
