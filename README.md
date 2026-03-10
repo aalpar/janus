@@ -20,11 +20,11 @@ ownership.
 janus create db-migration --sa janus-ops
 
 # Patch connection strings across namespaces
-janus add db-migration --type Patch --target ConfigMap/app-config -n frontend \
+janus add db-migration --type Patch --target ConfigMap/app-config --target-ns frontend \
   -f connection-patch.yaml
-janus add db-migration --type Patch --target ConfigMap/app-config -n backend \
+janus add db-migration --type Patch --target ConfigMap/app-config --target-ns backend \
   -f connection-patch.yaml --order 1
-janus add db-migration --type Patch --target Deployment/api-server -n backend \
+janus add db-migration --type Patch --target Deployment/api-server --target-ns backend \
   -f env-patch.yaml --order 2
 
 # Seal to begin processing
@@ -39,8 +39,8 @@ and restored on rollback.
 kubectl get transaction db-migration
 ```
 ```
-NAME            SEALED   PHASE       AGE
-db-migration    true     Committed   34s
+NAME            PHASE       SEALED   AGE
+db-migration    Committed   true     34s
 ```
 
 ## How it works
@@ -102,13 +102,7 @@ the intermediate state is dangerous and GitOps doesn't apply:
 - kubectl v1.30+
 - [cert-manager](https://cert-manager.io/docs/installation/) (for webhook TLS)
 
-### Helm (recommended)
-
-```sh
-helm install janus oci://ghcr.io/aalpar/janus/chart --namespace janus-system --create-namespace
-```
-
-Or from source:
+### Helm
 
 ```sh
 helm install janus chart/ --namespace janus-system --create-namespace
@@ -123,7 +117,7 @@ Pre-built multi-arch images (amd64 + arm64) are published to
 
 ```sh
 make install
-make deploy IMG=ghcr.io/aalpar/janus:v0.2.0
+make deploy IMG=ghcr.io/aalpar/janus:<version>
 ```
 
 ### Install the CLI
