@@ -2,7 +2,7 @@
 
 ## Versioning
 
-- Janus is at v0.2.0 with zero consumers. Break freely — no stability guarantees until real users exist.
+- Janus is at v0.2.1 with zero consumers. Break freely — no stability guarantees until real users exist.
 - API group: `tx.janus.io/v1alpha1`
 
 ## Architecture
